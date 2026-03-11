@@ -110,12 +110,16 @@ Content-Type: application/json
 
 {
   "username": "john_doe",
-  "datasets": ["building_energy_2024", "weather_data"],
+  "datasets": {
+    "aliki@gmail.com": "alikis_dataset",
+    "pilot": "weather_data"
+  },
   "notebooks": null
 }
 ```
 
-- `datasets`: names of datasets to make available
+- `datasets`: mapping of dataset owner to dataset name to make available in the
+  target user's volume
 - `notebooks`: `null` = provision ALL platform notebooks (skip if already present);
   pass a list of names to provision specific ones; pass `[]` to skip notebooks.
 - `force_notebook_refresh`: set `true` to overwrite existing notebooks.

@@ -12,10 +12,13 @@ services:
       # read-write (notebooks).  The host path must match the value configured
       # in JupyterHub's pre_spawn_hook.
       - /home/energyguard/jupyterhub_data:/jupyterhub_data
+    ports:
+      # Bind to loopback so the service is reachable via SSH port forwarding
+      # without exposing it publicly on the server network interface.
+      - "6060:6060"
     networks:
       - nginxproxy_energyguard_net
-    # No port mapping — accessible only within the Docker network.
-    # Other services reach it at http://data-management-server:6060
+    # Other containers can still reach it at http://data-management-server:6060
 
 networks:
   nginxproxy_energyguard_net:

@@ -19,53 +19,60 @@ logger = logging.getLogger(__name__)
 _AuthDep = Annotated[str, Depends(verify_api_key)]
 
 
-@router.post("/upload", summary="Upload a dataset file (and optional metadata) to MinIO")
+@router.post("/upload", summary="Upload dataset files (and optional metadata) to MinIO")
 async def upload_dataset(
     _key: _AuthDep,
     username: str = Form(...),
     dataset_name: str = Form(...),
-    file: UploadFile = File(..., description="CSV / tabular data file"),
-    metadata: Optional[str] = Form(
-        None, description="Optional JSON string with dataset metadata"
+    files: list[UploadFile] = File(..., description="Files that belong to the dataset"),
+    metadata: Optional[UploadFile] = File(
+        None, description="Optional JSON metadata file"
     ),
 ):
-    """Store the dataset under ``user_{username}/{dataset_name}/data.csv`` in
-    the ``datasets`` bucket.  If *metadata* is provided it is stored alongside
-    as ``metadata.json``.
+    """Store dataset files under ``user_{username}/{dataset_name}/dataset_<filename>``
+    in the ``datasets`` bucket. If *metadata* is provided it is stored
+    alongside as ``metadata_<filename>``.
     """
     client = get_minio_client()
     object_prefix = f"user_{username}/{dataset_name}"
-    data_object = f"{object_prefix}/data.csv"
+    uploaded_objects: list[str] = []
 
     try:
-        content = await file.read()
-        client.put_object(
-            settings.datasets_bucket,
-            data_object,
-            io.BytesIO(content),
-            length=len(content),
-            content_type=file.content_type or "text/csv",
-        )
+        for file in files:
+            dataset_filename = Path(file.filename or "data").name
+            data_object = f"{object_prefix}/{dataset_filename}"
+            content = await file.read()
+            client.put_object(
+                settings.datasets_bucket,
+                data_object,
+                io.BytesIO(content),
+                length=len(content),
+                content_type=file.content_type or "application/octet-stream",
+            )
+            uploaded_objects.append(data_object)
         logger.info("Uploaded dataset %s/%s", username, dataset_name)
 
         if metadata:
             try:
-                meta_dict = json.loads(metadata)
-            except json.JSONDecodeError:
-                meta_dict = {"raw": metadata}
+                meta_content = await metadata.read()
+                meta_dict = json.loads(meta_content)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid metadata JSON: {exc}")
+            metadata_filename = Path(metadata.filename or "metadata.json").name
             meta_bytes = json.dumps(meta_dict, indent=2).encode()
             client.put_object(
                 settings.datasets_bucket,
-                f"{object_prefix}/metadata.json",
+                f"{object_prefix}/{metadata_filename}",
                 io.BytesIO(meta_bytes),
                 length=len(meta_bytes),
                 content_type="application/json",
             )
+            uploaded_objects.append(f"{object_prefix}/metadata_{metadata_filename}")
     except S3Error as exc:
         logger.error("MinIO upload error: %s", exc)
         raise HTTPException(status_code=500, detail=f"Storage error: {exc}")
 
-    return {"status": "ok", "object": data_object}
+    return {"status": "ok", "objects": uploaded_objects}
 
 
 @router.post("/metadata", summary="Upload or replace a dataset's metadata.json")
@@ -76,16 +83,21 @@ async def upload_metadata(
     metadata: UploadFile = File(...),
 ):
     client = get_minio_client()
-    object_path = f"user_{username}/{dataset_name}/metadata.json"
     try:
         content = await metadata.read()
+        meta_dict = json.loads(content)
+        metadata_filename = Path(metadata.filename or "metadata.json").name
+        object_path = f"user_{username}/{dataset_name}/{metadata_filename}"
+        payload = json.dumps(meta_dict, indent=2).encode()
         client.put_object(
             settings.datasets_bucket,
             object_path,
-            io.BytesIO(content),
-            length=len(content),
+            io.BytesIO(payload),
+            length=len(payload),
             content_type="application/json",
         )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid metadata JSON: {exc}")
     except S3Error as exc:
         raise HTTPException(status_code=500, detail=f"Storage error: {exc}")
 
@@ -113,9 +125,7 @@ def list_datasets(_key: _AuthDep, username: Optional[str] = None):
         if len(parts) < 3:
             continue
         owner, dataset = parts[0], parts[1]
-        grouped.setdefault((owner, dataset), []).append(
-            (obj.object_name, obj.size or 0)
-        )
+        grouped.setdefault((owner, dataset), []).append(("/".join(parts[2:]), obj.size or 0))
 
     return [
         DatasetInfo(
@@ -136,19 +146,20 @@ def delete_dataset(_key: _AuthDep, username: str, dataset_name: str):
         objects = list(
             client.list_objects(settings.datasets_bucket, prefix=prefix, recursive=True)
         )
-        if not objects:
-            raise HTTPException(status_code=404, detail="Dataset not found in MinIO")
         for obj in objects:
             client.remove_object(settings.datasets_bucket, obj.object_name)
     except S3Error as exc:
         raise HTTPException(status_code=500, detail=f"Storage error: {exc}")
 
-    # Remove from local JupyterHub cache as well (best-effort)
-    local_path = (
-        Path(settings.jupyterhub_data_path) / "datasets" / username / dataset_name
-    )
-    if local_path.exists():
-        shutil.rmtree(local_path)
+    # Remove from every user's local JupyterHub cache as well (best-effort).
+    base_datasets = Path(settings.jupyterhub_data_path) / "datasets"
+    if base_datasets.exists():
+        for user_dir in base_datasets.iterdir():
+            if not user_dir.is_dir():
+                continue
+            local_path = user_dir / dataset_name
+            if local_path.exists():
+                shutil.rmtree(local_path)
 
     return {"status": "deleted", "dataset": f"user_{username}/{dataset_name}"}
 

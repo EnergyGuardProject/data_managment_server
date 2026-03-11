@@ -2,7 +2,7 @@
 redirects a user to their JupyterHub session.
 
 The server:
-1. Resolves each requested dataset
+1. Downloads each requested dataset from its explicit owner
 2. Downloads missing / all requested datasets to the shared host cache.
 3. Downloads notebooks that the user does not already have (unless
    force_notebook_refresh is True).
@@ -13,10 +13,11 @@ JupyterHub singleuser container under ``/home/jovyan/datasets`` and
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from minio.error import S3Error
 
 from app.config import settings
@@ -24,7 +25,6 @@ from app.dependencies import verify_api_key
 from app.models import ProvisionRequest, ProvisionResult
 from app.services.minio_client import (
     download_dataset_to_cache,
-    find_dataset_owner,
     get_minio_client,
 )
 
@@ -32,6 +32,15 @@ router = APIRouter(prefix="/provision", tags=["provision"])
 logger = logging.getLogger(__name__)
 
 _AuthDep = Annotated[str, Depends(verify_api_key)]
+
+DATASET_DIR_MODE = 0o755
+NOTEBOOK_DIR_MODE = 0o777
+NOTEBOOK_FILE_MODE = 0o666
+
+
+def _set_mode(path: Path, mode: int) -> None:
+    """Best-effort permission normalization for bind-mounted shared paths."""
+    os.chmod(path, mode)
 
 
 @router.post("/user", response_model=ProvisionResult, summary="Provision datasets and notebooks for a JupyterHub user")
@@ -47,35 +56,25 @@ def provision_user(_key: _AuthDep, req: ProvisionRequest):
             Path(settings.jupyterhub_data_path) / "datasets" / req.username
         )
         datasets_base.mkdir(parents=True, exist_ok=True)
+        _set_mode(datasets_base, DATASET_DIR_MODE)
 
-        for dataset_name in req.datasets:
+        for dataset_owner, dataset_name in req.datasets.items():
             try:
-                owner = find_dataset_owner(
-                    client, dataset_name, req.username
-                )
-                if owner is None:
-                    msg = (
-                        f"Dataset '{dataset_name}' not found for user "
-                        f"'{req.username}'"
-                        + ", or pilot."
-                    )
-                    logger.warning(msg)
-                    errors.append(msg)
-                    continue
-
                 files = download_dataset_to_cache(
-                    client, owner, dataset_name, req.username
+                    client, dataset_owner, dataset_name, req.username
                 )
                 if files:
-                    datasets_provisioned.append(dataset_name)
+                    datasets_provisioned.append(f"{dataset_owner}/{dataset_name}")
                 else:
                     errors.append(
-                        f"Dataset '{dataset_name}' (owner: {owner}) is empty in MinIO."
+                        f"Dataset '{dataset_name}' (owner: {dataset_owner}) is empty in MinIO."
                     )
             except S3Error as exc:
-                errors.append(f"Dataset '{dataset_name}': MinIO error – {exc}")
+                errors.append(
+                    f"Dataset '{dataset_name}' (owner: {dataset_owner}): MinIO error – {exc}"
+                )
             except Exception as exc:
-                errors.append(f"Dataset '{dataset_name}': {exc}")
+                errors.append(f"Dataset '{dataset_name}' (owner: {dataset_owner}): {exc}")
 
     # ── Notebooks ─────────────────────────────────────────────────────────────
     # req.notebooks == None  → provision all available notebooks
@@ -85,6 +84,7 @@ def provision_user(_key: _AuthDep, req: ProvisionRequest):
             Path(settings.jupyterhub_data_path) / "notebooks" / req.username
         )
         notebooks_base.mkdir(parents=True, exist_ok=True)
+        _set_mode(notebooks_base, NOTEBOOK_DIR_MODE)
 
         try:
             all_objects = list(
@@ -114,6 +114,7 @@ def provision_user(_key: _AuthDep, req: ProvisionRequest):
                 finally:
                     response.close()
                     response.release_conn()
+                _set_mode(dest_file, NOTEBOOK_FILE_MODE)
                 notebooks_provisioned.append(obj.object_name)
                 logger.info("Provisioned notebook %s for %s", obj.object_name, req.username)
             except S3Error as exc:

@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 
@@ -6,9 +6,9 @@ class ProvisionRequest(BaseModel):
     """Sent by the dashboard backend when a user opens a JupyterHub session."""
 
     username: str
-    # Names of datasets (from any source) to make available in the user's
-    # JupyterHub home
-    datasets: list[str] = []
+    # Mapping of dataset owner -> dataset name to provision into the target
+    # user's JupyterHub volume.
+    datasets: dict[str, str] = Field(default_factory=dict)
     # Notebook file-names to provision.  Pass None to provision ALL notebooks
     # from MinIO.  Pass an empty list to skip notebook provisioning.
     notebooks: Optional[list[str]] = None
