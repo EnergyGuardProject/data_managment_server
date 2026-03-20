@@ -1,7 +1,7 @@
 # EnergyGuard Data Management Server (DMS)
 
 Internal FastAPI service that sits between the dashboard and JupyterHub.
-It manages dataset/notebook storage in MinIO and provisions files into each
+It provisions datasets and notebook files into each
 user's JupyterHub home directory.
 
 ## Architecture
