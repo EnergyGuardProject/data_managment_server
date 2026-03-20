@@ -7,15 +7,15 @@ user's JupyterHub home directory.
 ## Architecture
 
 ```
-Dashboard backend  ──POST /api/v1/provision/user──▶  Data Management Server
-                                                           │
-                                          ┌────────────────┼────────────────┐
-                                          ▼                ▼                ▼
-                                        MinIO          Host FS         MinIO
-                                    (read/write)   /jupyterhub_data  (read only)
+Dashboard backend  ──POST /api/v1/provision/user──▶  Data Management Server  ◀──MinIO
+                                                        │
+                                                        │
+                                                        ▼
+                                                      Host FS              
+                                               /jupyterhub_data 
                                                         │
                                           ┌─────────────┴──────────────┐
-                                          ▼                             ▼
+                                          ▼                            ▼
                                /home/jovyan/datasets         /home/jovyan/notebooks
                                (read-only bind-mount)       (read-write bind-mount)
                                in singleuser container       in singleuser container
