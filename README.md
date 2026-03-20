@@ -70,7 +70,7 @@ Host file system layout (mounted into JupyterHub containers):
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/api/v1/datasets` | List datasets (`?username=x` to filter by owner) |
-| `POST` | `/api/v1/datasets/update` | Re-download a dataset for all users that have it cached (for pilot datasets only in the future) |
+| `POST` | `/api/v1/datasets/update` | Re-download a dataset for all users that have it cached (mainly for pilot datasets in the future) |
 | `GET`  | `/api/v1/notebooks` | List notebooks available in MinIO |
 | `POST` | `/api/v1/provision/user` | Provision datasets + notebooks for a user |
 | `DELETE` | `/api/v1/datasets/{username}/{dataset_name}` | Delete dataset from MinIO and local cache |
