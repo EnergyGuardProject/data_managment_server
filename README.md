@@ -7,7 +7,9 @@ user's JupyterHub home directory.
 ## Architecture
 
 ```
-Dashboard backend  ──POST /api/v1/provision/user──▶  Data Management Server  ◀──MinIO
+                                                                                     |────── Data lake (future)
+                                                                                     |
+Dashboard backend  ──POST /api/v1/provision/user──▶  Data Management Server  ◀──────┴───── MinIO
                                                         │
                                                         │
                                                         ▼
