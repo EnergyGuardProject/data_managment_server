@@ -1,21 +1,23 @@
 # EnergyGuard Data Management Server (DMS)
 
 Internal FastAPI service that sits between the dashboard and JupyterHub.
-It manages dataset/notebook storage in MinIO and provisions files into each
+It provisions datasets and notebook files into each
 user's JupyterHub home directory.
 
 ## Architecture
 
 ```
-Dashboard backend  ──POST /api/v1/provision/user──▶  Data Management Server
-                                                           │
-                                          ┌────────────────┼────────────────┐
-                                          ▼                ▼                ▼
-                                        MinIO          Host FS         MinIO
-                                    (read/write)   /jupyterhub_data  (read only)
+                                                                                     |────── Data lake (future)
+                                                                                     |
+Dashboard backend  ──POST /api/v1/provision/user──▶  Data Management Server  ◀──────┴───── MinIO
+                                                        │
+                                                        │
+                                                        ▼
+                                                      Host FS              
+                                               /jupyterhub_data 
                                                         │
                                           ┌─────────────┴──────────────┐
-                                          ▼                             ▼
+                                          ▼                            ▼
                                /home/jovyan/datasets         /home/jovyan/notebooks
                                (read-only bind-mount)       (read-write bind-mount)
                                in singleuser container       in singleuser container
@@ -70,7 +72,7 @@ Host file system layout (mounted into JupyterHub containers):
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/api/v1/datasets` | List datasets (`?username=x` to filter by owner) |
-| `POST` | `/api/v1/datasets/update` | Re-download a dataset for all users that have it cached (for pilot datasets only in the future) |
+| `POST` | `/api/v1/datasets/update` | Re-download a dataset for all users that have it cached (mainly for pilot datasets in the future) |
 | `GET`  | `/api/v1/notebooks` | List notebooks available in MinIO |
 | `POST` | `/api/v1/provision/user` | Provision datasets + notebooks for a user |
 | `DELETE` | `/api/v1/datasets/{username}/{dataset_name}` | Delete dataset from MinIO and local cache |
