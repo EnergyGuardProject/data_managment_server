@@ -61,7 +61,8 @@ def provision_user(_key: _AuthDep, req: ProvisionRequest):
         for dataset_owner, dataset_name in req.datasets.items():
             try:
                 files = download_dataset_to_cache(
-                    client, dataset_owner, dataset_name, req.username
+                    client, dataset_owner, dataset_name, req.username,
+                    overwrite=False,
                 )
                 if files:
                     datasets_provisioned.append(f"{dataset_owner}/{dataset_name}")

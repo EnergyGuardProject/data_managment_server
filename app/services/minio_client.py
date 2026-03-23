@@ -46,9 +46,14 @@ def download_dataset_to_cache(
     owner: str,
     dataset_name: str,
     target_username: str,
+    *,
+    overwrite: bool = True,
 ) -> list[str]:
     """Download every file under user_{owner}/{dataset_name}/ into
     {jupyterhub_data_path}/datasets/{target_username}/{dataset_name}/.
+
+    When *overwrite* is ``False``, files that already exist locally are kept
+    as-is and only missing files are downloaded.
 
     Returns the list of filenames that were written.
     """
@@ -71,11 +76,12 @@ def download_dataset_to_cache(
         if obj.object_name and obj.object_name.startswith(prefix)
     }
 
-    for local_path in sorted(dest_dir.rglob("*"), reverse=True):
-        if local_path.is_file() and local_path.relative_to(dest_dir) not in minio_paths:
-            local_path.unlink()
-        elif local_path.is_dir() and not any(local_path.iterdir()):
-            local_path.rmdir()
+    if overwrite:
+        for local_path in sorted(dest_dir.rglob("*"), reverse=True):
+            if local_path.is_file() and local_path.relative_to(dest_dir) not in minio_paths:
+                local_path.unlink()
+            elif local_path.is_dir() and not any(local_path.iterdir()):
+                local_path.rmdir()
 
     if not objects:
         if not any(dest_dir.iterdir()):
@@ -88,6 +94,10 @@ def download_dataset_to_cache(
         if not relative_name:
             continue
         dest_file = dest_dir / relative_name
+        if not overwrite and dest_file.exists():
+            logger.debug("File already exists, skipping: %s", dest_file)
+            downloaded.append(relative_name)
+            continue
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         _set_mode(dest_file.parent, DATASET_DIR_MODE)
         response = client.get_object(settings.datasets_bucket, obj.object_name)
