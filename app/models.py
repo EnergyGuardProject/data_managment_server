@@ -6,8 +6,15 @@ class ProvisionRequest(BaseModel):
     """Sent by the dashboard backend when a user opens a JupyterHub session."""
 
     username: str
-    # Mapping of dataset owner -> dataset name to provision into the target
-    # user's JupyterHub volume.
+    # Mapping of ``dataset_minio_path`` -> ``dataset_name`` to provision into
+    # the target user's JupyterHub volume.
+    #
+    # * ``dataset_minio_path`` is the bucket-relative prefix where the dataset
+    #   actually lives in MinIO, i.e. ``user_<owner>/<original_dataset_name>``
+    #   (the ``user_`` prefix is optional). It never changes.
+    # * ``dataset_name`` is the name the user picked for the dataset (possibly
+    #   renamed via the dashboard). It is the folder name the dataset will get
+    #   under ``/home/jovyan/datasets/`` in JupyterHub.
     datasets: dict[str, str] = Field(default_factory=dict)
     # Notebook file-names to provision.  Pass None to provision ALL notebooks
     # from MinIO.  Pass an empty list to skip notebook provisioning.

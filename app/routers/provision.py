@@ -58,24 +58,40 @@ def provision_user(_key: _AuthDep, req: ProvisionRequest):
         datasets_base.mkdir(parents=True, exist_ok=True)
         _set_mode(datasets_base, DATASET_DIR_MODE)
 
-        for dataset_owner, dataset_name in req.datasets.items():
+        for dataset_minio_path, dataset_name in req.datasets.items():
+            # ``dataset_minio_path`` is the bucket-relative MinIO prefix
+            # (``user_<owner>/<original_name>``); ``dataset_name`` is the
+            # name the user picked and the folder name to materialize on disk.
+            path = dataset_minio_path.strip("/")
+            if path.startswith("user_"):
+                path = path[len("user_"):]
+            try:
+                dataset_owner, minio_dataset_name = path.split("/", 1)
+            except ValueError:
+                errors.append(
+                    f"Invalid dataset_minio_path '{dataset_minio_path}': "
+                    "expected 'user_<owner>/<dataset_name>'."
+                )
+                continue
             try:
                 files = download_dataset_to_cache(
-                    client, dataset_owner, dataset_name, req.username,
-                    overwrite=False,
+                    client, dataset_owner, minio_dataset_name, req.username,
+                    overwrite=False, local_dataset_name=dataset_name,
                 )
                 if files:
-                    datasets_provisioned.append(f"{dataset_owner}/{dataset_name}")
+                    datasets_provisioned.append(
+                        f"{dataset_minio_path} -> {dataset_name}"
+                    )
                 else:
                     errors.append(
-                        f"Dataset '{dataset_name}' (owner: {dataset_owner}) is empty in MinIO."
+                        f"Dataset '{dataset_minio_path}' is empty in MinIO."
                     )
             except S3Error as exc:
                 errors.append(
-                    f"Dataset '{dataset_name}' (owner: {dataset_owner}): MinIO error – {exc}"
+                    f"Dataset '{dataset_minio_path}': MinIO error – {exc}"
                 )
             except Exception as exc:
-                errors.append(f"Dataset '{dataset_name}' (owner: {dataset_owner}): {exc}")
+                errors.append(f"Dataset '{dataset_minio_path}': {exc}")
 
     # ── Notebooks ─────────────────────────────────────────────────────────────
     # req.notebooks == None  → provision all available notebooks

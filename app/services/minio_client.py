@@ -48,21 +48,29 @@ def download_dataset_to_cache(
     target_username: str,
     *,
     overwrite: bool = True,
+    local_dataset_name: str | None = None,
 ) -> list[str]:
     """Download every file under user_{owner}/{dataset_name}/ into
-    {jupyterhub_data_path}/datasets/{target_username}/{dataset_name}/.
+    {jupyterhub_data_path}/datasets/{target_username}/{local_dataset_name}/.
+
+    The MinIO source path always uses the original ``dataset_name`` (the
+    storage convention is unchanged). When ``local_dataset_name`` is provided
+    the dataset is materialized on disk under that name instead — this is how
+    the dashboard exposes user-renamed datasets in JupyterHub while keeping
+    the MinIO layout stable. If omitted it defaults to ``dataset_name``.
 
     When *overwrite* is ``False``, files that already exist locally are kept
     as-is and only missing files are downloaded.
 
     Returns the list of filenames that were written.
     """
+    local_name = local_dataset_name or dataset_name
     prefix = f"user_{owner}/{dataset_name}/"
     dest_dir = (
         Path(settings.jupyterhub_data_path)
         / "datasets"
         / target_username
-        / dataset_name
+        / local_name
     )
     dest_dir.mkdir(parents=True, exist_ok=True)
     _set_mode(dest_dir, DATASET_DIR_MODE)

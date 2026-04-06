@@ -138,6 +138,32 @@ def list_datasets(_key: _AuthDep, username: Optional[str] = None):
     ]
 
 
+@router.delete(
+    "/cache/{username}/{dataset_name}",
+    summary="Delete a dataset only from a single user's JupyterHub cache (not MinIO)",
+)
+def delete_user_cached_dataset(_key: _AuthDep, username: str, dataset_name: str):
+    """Remove ``/jupyterhub_data/datasets/{username}/{dataset_name}/`` from
+    the host cache. The dataset is left untouched in MinIO and in every other
+    user's cache. ``dataset_name`` is the local folder name as it appears in
+    JupyterHub (which may be a renamed dataset).
+    """
+    local_path = (
+        Path(settings.jupyterhub_data_path)
+        / "datasets"
+        / username
+        / dataset_name
+    )
+    if not local_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Dataset '{dataset_name}' not found in cache for user '{username}'",
+        )
+    shutil.rmtree(local_path)
+    logger.info("Removed cached dataset %s for user %s", dataset_name, username)
+    return {"status": "deleted", "username": username, "dataset_name": dataset_name}
+
+
 @router.delete("/{username}/{dataset_name}", summary="Delete a dataset from MinIO and local cache")
 def delete_dataset(_key: _AuthDep, username: str, dataset_name: str):
     client = get_minio_client()

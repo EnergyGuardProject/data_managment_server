@@ -76,6 +76,7 @@ Host file system layout (mounted into JupyterHub containers):
 | `GET`  | `/api/v1/notebooks` | List notebooks available in MinIO |
 | `POST` | `/api/v1/provision/user` | Provision datasets + notebooks for a user |
 | `DELETE` | `/api/v1/datasets/{username}/{dataset_name}` | Delete dataset from MinIO and local cache |
+| `DELETE` | `/api/v1/datasets/cache/{username}/{dataset_name}` | Delete dataset only from one user's JupyterHub cache (MinIO untouched) |
 | `POST` | `/api/v1/datasets/upload` | Upload one or more dataset files (+ optional metadata) to MinIO (for testing) |
 | `POST` | `/api/v1/datasets/metadata` | Upload/replace a dataset's metadata.json (for testing)|
 | `GET`  | `/health` | Health check |
@@ -129,25 +130,45 @@ Content-Type: application/json
 {
   "username": "john_doe",
   "datasets": {
-    "aliki@gmail.com": "alikis_dataset",
-    "pilot": "weather_data"
+    "user_aliki@gmail.com/temperature_2024": "alikis_dataset",
+    "user_pilot/raw_weather": "weather_data"
   },
   "notebooks": null
 }
 ```
 
-- `datasets`: mapping of dataset owner → dataset name to make available in the
-  target user's volume
+- `datasets`: mapping of `dataset_minio_path` → `dataset_name`.
+  - `dataset_minio_path` is the bucket-relative prefix where the dataset
+    actually lives in MinIO (`user_<owner>/<original_dataset_name>`). The
+    `user_` prefix is optional. **The MinIO path never changes** — the
+    storage convention is unchanged.
+  - `dataset_name` is the name the user picked for the dataset (possibly
+    renamed via the dashboard). It is the folder name that the dataset will
+    be materialized under in JupyterHub at
+    `/home/jovyan/datasets/<dataset_name>/`. Because users can rename
+    datasets from the dashboard, `dataset_name` may differ from the original
+    name embedded in `dataset_minio_path`.
 - `notebooks`: `null` = provision ALL platform notebooks (skip if already present);
   pass a list of names to provision specific ones; pass `[]` to skip notebooks entirely
 - `force_notebook_refresh`: set `true` to overwrite existing notebooks
+
+So in the example above, `john_doe`'s JupyterHub volume will end up with:
+
+```
+/home/jovyan/datasets/
+├── alikis_dataset/   ← downloaded from user_aliki@gmail.com/temperature_2024
+└── weather_data/     ← downloaded from user_pilot/raw_weather
+```
 
 Returns:
 
 ```json
 {
   "username": "john_doe",
-  "datasets_provisioned": ["aliki@gmail.com/alikis_dataset", "pilot/weather_data"],
+  "datasets_provisioned": [
+    "user_aliki@gmail.com/temperature_2024 -> alikis_dataset",
+    "user_pilot/raw_weather -> weather_data"
+  ],
   "notebooks_provisioned": ["notebook_1.ipynb"],
   "errors": []
 }
@@ -157,6 +178,15 @@ Returns:
 
 Removes all objects under `user_{username}/{dataset_name}/` in MinIO and
 deletes any cached copies at `/jupyterhub_data/datasets/*/{dataset_name}/`.
+
+### DELETE `/api/v1/datasets/cache/{username}/{dataset_name}`
+
+Removes only `/jupyterhub_data/datasets/{username}/{dataset_name}/` from the
+host cache. MinIO is **not** touched, and other users that have the same
+dataset cached are unaffected. `dataset_name` here is the local folder name
+as it appears in JupyterHub (which may be a user-chosen rename of the
+underlying MinIO dataset). Returns `404` if the user has no such cached
+dataset.
 
 ### POST `/api/v1/datasets/upload` (for testing, this will be done via the dashboard)
 
