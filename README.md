@@ -130,8 +130,8 @@ Content-Type: application/json
 {
   "username": "john_doe",
   "datasets": {
-    "user_aliki@gmail.com/temperature_2024": "alikis_dataset",
-    "user_pilot/raw_weather": "weather_data"
+    "aliki@gmail.com/temperature_2024": "alikis_dataset",
+    "pilot@pilot.com/raw_weather": "weather_data"
   },
   "notebooks": null
 }
@@ -139,9 +139,7 @@ Content-Type: application/json
 
 - `datasets`: mapping of `dataset_minio_path` → `dataset_name`.
   - `dataset_minio_path` is the bucket-relative prefix where the dataset
-    actually lives in MinIO (`user_<owner>/<original_dataset_name>`). The
-    `user_` prefix is optional. **The MinIO path never changes** — the
-    storage convention is unchanged.
+    actually lives in MinIO (`<owner>/<original_dataset_name>`). 
   - `dataset_name` is the name the user picked for the dataset (possibly
     renamed via the dashboard). It is the folder name that the dataset will
     be materialized under in JupyterHub at
@@ -166,7 +164,7 @@ Returns:
 {
   "username": "john_doe",
   "datasets_provisioned": [
-    "user_aliki@gmail.com/temperature_2024 -> alikis_dataset",
+    "aliki@gmail.com/temperature_2024 -> alikis_dataset",
     "user_pilot/raw_weather -> weather_data"
   ],
   "notebooks_provisioned": ["notebook_1.ipynb"],
