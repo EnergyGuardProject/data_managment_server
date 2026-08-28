@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from minio.error import S3Error
 
 from app.config import settings
-from app.routers import datasets, notebooks, provision
+from app.routers import datasets, notebooks, pilot_export, provision
 from app.services.minio_client import ensure_buckets, get_minio_client
 
 logging.basicConfig(
@@ -25,6 +25,7 @@ app = FastAPI(
 app.include_router(datasets.router, prefix="/api/v1")
 app.include_router(notebooks.router, prefix="/api/v1")
 app.include_router(provision.router, prefix="/api/v1")
+app.include_router(pilot_export.router, prefix="/api/v1")
 
 
 @app.on_event("startup")

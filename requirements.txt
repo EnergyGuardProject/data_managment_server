@@ -5,3 +5,8 @@ python-multipart==0.0.20
 pydantic-settings==2.6.1
 aiofiles==24.1.0
 httpx==0.27.2
+
+# Pilot export: CARTIF data lake (Postgres) + nightly scheduling.
+# psycopg2-binary ships its own libpq, so the image needs no build deps.
+psycopg2-binary==2.9.10
+APScheduler==3.10.4

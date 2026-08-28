@@ -20,6 +20,34 @@ services:
       - nginxproxy_energyguard_net
     # Other containers can still reach it at http://data-management-server:6060
 
+  # Nightly pilot exports (CARTIF data lake -> gzip -> MinIO + shared dir).
+  #
+  # Same image, different command. Kept out of the API container on purpose:
+  #   * a multi-GB CEDER export cannot compete with request handling for the
+  #     GIL or the container's memory budget;
+  #   * redeploying the API no longer kills an export that is halfway through.
+  #
+  # Force a refresh without waiting for the schedule:
+  #   docker compose exec pilot-export-scheduler python -m app.export_cli REA
+  pilot-export-scheduler:
+    build: .
+    image: data-management-server:latest
+    container_name: pilot-export-scheduler
+    restart: unless-stopped
+    command: ["python", "-m", "app.scheduler"]
+    env_file:
+      - .env
+    environment:
+      # Cron slots below are container-local time; pin it to the host's so the
+      # "off-peak" window means what it says.
+      - TZ=${TZ:-Europe/Athens}
+    volumes:
+      # Writes each partner's export to <shared>/pilot_datasets/<PARTNER>/.
+      # Same host path as the API container — one copy of the data, shared.
+      - /mnt/datadisk/volumes/jupyterhub_data:/jupyterhub_data
+    networks:
+      - nginxproxy_energyguard_net
+
 networks:
   nginxproxy_energyguard_net:
     external: true

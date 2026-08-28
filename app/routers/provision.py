@@ -17,14 +17,16 @@ import os
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from minio.error import S3Error
 
 from app.config import settings
 from app.dependencies import verify_api_key
-from app.models import ProvisionRequest, ProvisionResult
+from app.models import PilotProvisionRequest, ProvisionRequest, ProvisionResult
+from app.pilots import PARTNERS, normalize_partner, pilot_file_name
 from app.services.minio_client import (
     download_dataset_to_cache,
+    download_object_atomic,
     get_minio_client,
 )
 
@@ -50,6 +52,22 @@ def _set_mode(path: Path, mode: int) -> None:
         os.chmod(path, mode)
     except PermissionError as exc:
         logger.warning("chmod %o on %s skipped: %s", mode, path, exc)
+
+
+def _safe_component(value: str, field: str) -> str:
+    """Validate a caller-supplied string used as a single path component.
+
+    ``username`` and ``dataset_name`` both come from the dashboard and both get
+    joined onto a filesystem path, so a value containing ``/`` or ``..`` would
+    let a caller write outside the shared directory.
+    """
+    candidate = (value or "").strip()
+    if not candidate or candidate in {".", ".."} or "/" in candidate or "\0" in candidate:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field}: must be a single non-empty path component.",
+        )
+    return candidate
 
 
 @router.post("/user", response_model=ProvisionResult, summary="Provision datasets and notebooks for a JupyterHub user")
@@ -134,13 +152,13 @@ def provision_user(_key: _AuthDep, req: ProvisionRequest):
                 logger.debug("Notebook already exists, skipping: %s", obj.object_name)
                 continue
             try:
-                response = client.get_object(settings.notebooks_bucket, obj.object_name)
-                try:
-                    dest_file.write_bytes(response.read())
-                finally:
-                    response.close()
-                    response.release_conn()
-                _set_mode(dest_file, NOTEBOOK_FILE_MODE)
+                download_object_atomic(
+                    client,
+                    settings.notebooks_bucket,
+                    obj.object_name,
+                    dest_file,
+                    mode=NOTEBOOK_FILE_MODE,
+                )
                 notebooks_provisioned.append(obj.object_name)
                 logger.info("Provisioned notebook %s for %s", obj.object_name, req.username)
             except S3Error as exc:
@@ -152,6 +170,117 @@ def provision_user(_key: _AuthDep, req: ProvisionRequest):
         username=req.username,
         datasets_provisioned=datasets_provisioned,
         notebooks_provisioned=notebooks_provisioned,
+        errors=errors,
+    )
+
+
+@router.post(
+    "/pilot",
+    response_model=ProvisionResult,
+    summary="Link a pilot dataset into a JupyterHub user's datasets directory",
+)
+def provision_pilot(_key: _AuthDep, req: PilotProvisionRequest):
+    """Give a user access to a pilot dataset — by symlink, never by copy.
+
+    Pilot data is platform-owned and byte-identical for every user, so exactly
+    one copy exists on disk: the nightly export in
+    ``<shared>/pilot_datasets/<PARTNER>/``. That directory is bind-mounted
+    read-only into every singleuser container at ``settings.pilot_mount_path``.
+    All this endpoint does is create
+
+        <shared>/datasets/<username>/<dataset_name>
+            -> <pilot_mount_path>/<PARTNER>
+
+    Two consequences worth spelling out:
+
+    * The symlink target is a *container-side* absolute path, so the link is
+      dangling when viewed on the host and resolves correctly inside the user's
+      server. That is intended.
+    * We create it under the user's already-mounted data directory, so it shows
+      up in a server that is **already running** — Jupyter caches no filesystem
+      state, and no restart or respawn is needed.
+
+    Copying instead would multiply CEDER's ~500 MB (several GB uncompressed) by
+    the number of users, which is exactly what the per-user dataset path does
+    and what this endpoint exists to avoid.
+    """
+    partner = normalize_partner(req.partner)
+    if partner is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Unknown pilot partner '{req.partner}'. "
+                f"Known partners: {', '.join(PARTNERS)}."
+            ),
+        )
+
+    username = _safe_component(req.username, "username")
+    dataset_name = _safe_component(req.dataset_name, "dataset_name")
+
+    errors: list[str] = []
+    datasets_provisioned: list[str] = []
+
+    datasets_base = Path(settings.jupyterhub_data_path) / "datasets" / username
+    datasets_base.mkdir(parents=True, exist_ok=True)
+    _set_mode(datasets_base, DATASET_DIR_MODE)
+
+    # Container-side target. Built with posix separators on purpose: it is
+    # interpreted inside the singleuser container, not on this filesystem.
+    target = f"{settings.pilot_mount_path.rstrip('/')}/{partner}"
+    link_path = datasets_base / dataset_name
+
+    # The export may not have run yet for this partner. Still link it — the
+    # nightly job will fill it in — but tell the caller.
+    source_file = (
+        Path(settings.jupyterhub_data_path)
+        / settings.pilot_datasets_prefix
+        / partner
+        / pilot_file_name(partner)
+    )
+    if not source_file.exists():
+        errors.append(
+            f"Pilot data for '{partner}' has not been exported yet "
+            f"({source_file} is missing); the link will resolve once it has."
+        )
+
+    try:
+        if link_path.is_symlink():
+            # Idempotent: an identical link is a no-op, a stale one is repointed.
+            if os.readlink(link_path) == target:
+                logger.info(
+                    "Pilot dataset '%s' (%s) already linked for %s",
+                    dataset_name, partner, username,
+                )
+            else:
+                link_path.unlink()
+                os.symlink(target, link_path)
+                logger.info(
+                    "Re-pointed pilot dataset '%s' to %s for %s",
+                    dataset_name, target, username,
+                )
+            datasets_provisioned.append(f"{partner} -> {dataset_name}")
+        elif link_path.exists():
+            errors.append(
+                f"'{dataset_name}' already exists in {username}'s datasets "
+                "directory as a real file or directory; refusing to replace it."
+            )
+        else:
+            os.symlink(target, link_path)
+            datasets_provisioned.append(f"{partner} -> {dataset_name}")
+            logger.info(
+                "Linked pilot dataset '%s' (%s) -> %s for %s",
+                dataset_name, partner, target, username,
+            )
+    except FileExistsError:
+        # Concurrent identical call won the race — that is still success.
+        datasets_provisioned.append(f"{partner} -> {dataset_name}")
+    except OSError as exc:
+        errors.append(f"Could not link pilot dataset '{partner}': {exc}")
+
+    return ProvisionResult(
+        username=req.username,
+        datasets_provisioned=datasets_provisioned,
+        notebooks_provisioned=[],
         errors=errors,
     )
 

@@ -33,6 +33,12 @@ Bucket: datasets
         ├── file2.csv
         └── metadata.json        ← optional
 
+Bucket: datasets — pilot exports (written by the nightly job)
+└── pilot_datasets/             ← PILOT_DATASETS_PREFIX
+    ├── RDN/RDN.csv.gz
+    ├── CEDER/CEDER.csv.gz
+    └── …                       ← one object per partner
+
 Bucket: notebooks
 ├── notebook_1.ipynb
 └── notebook_2.ipynb
@@ -41,19 +47,26 @@ Bucket: notebooks
 Datasets support **multiple files** per dataset. All files under the
 `user_{username}/{dataset_name}/` prefix are treated as part of that dataset.
 
+Pilot exports are the exception — exactly one gzipped CSV per partner, refreshed
+nightly from the CARTIF data lake. See [Pilot datasets](#pilot-datasets).
+
 ## JupyterHub user home layout (after provisioning)
 
 ```
 /home/jovyan/
 ├── work/          ← persisted named volume (user's own work)
-├── datasets/      ← read-only bind-mount (provisioned by DMS)
-│   ├── dataset_xx/
-│   │   ├── file1.csv
-│   │   └── metadata.json
-│   └── dataset_yy/
-└── notebooks/     ← read-write bind-mount (provisioned by DMS once)
-    ├── notebook_1.ipynb
-    └── notebook_2.ipynb
+│   ├── datasets/  ← read-only bind-mount (provisioned by DMS)
+│   │   ├── dataset_xx/
+│   │   │   ├── file1.csv
+│   │   │   └── metadata.json
+│   │   ├── dataset_yy/
+│   │   └── REA Pilot Data → /home/jovyan/.pilot/REA   ← symlink, not a copy
+│   └── notebooks/ ← read-write bind-mount (provisioned by DMS once)
+│       ├── notebook_1.ipynb
+│       └── notebook_2.ipynb
+└── .pilot/        ← read-only bind-mount, ONE shared copy for all users
+    ├── REA/REA.csv.gz
+    └── …
 ```
 
 Host file system layout (mounted into JupyterHub containers):
@@ -63,8 +76,10 @@ Host file system layout (mounted into JupyterHub containers):
 ├── datasets/
 │   └── {username}/
 │       └── {dataset_name}/    ← synced from MinIO (0o755 / files 0o644)
-└── notebooks/
-    └── {username}/            ← provisioned once per user (0o777 / files 0o666)
+├── notebooks/
+│   └── {username}/            ← provisioned once per user (0o777 / files 0o666)
+└── pilot_datasets/
+    └── {PARTNER}/{PARTNER}.csv.gz   ← nightly export (0o755 / files 0o644)
 ```
 
 ## API Endpoints
@@ -207,6 +222,128 @@ Multipart form fields: `username`, `dataset_name`, `metadata` (file).
 Validates that the uploaded file is valid JSON before storing.
 
 
+### POST `/api/v1/provision/pilot`
+
+Gives a user access to a pilot dataset. Called by the dashboard.
+
+```json
+{ "username": "user@example.com", "partner": "RDN", "dataset_name": "RDN Pilot Data" }
+```
+
+`username` is the user's **email** — JupyterHub identifies users by email via
+Keycloak OIDC, and the per-user directories on disk are named by it.
+
+Returns the standard `ProvisionResult`. `404` if `partner` is not one of
+`RDN CEDER BER CEA CARTIF REA ENGREEN`; idempotent, so the dashboard can call
+it on every page load.
+
+This creates a **symlink**, not a copy:
+
+```
+/jupyterhub_data/datasets/{email}/{dataset_name}  ->  /home/jovyan/.pilot/{PARTNER}
+```
+
+The target is a container-side path, so the link is deliberately dangling when
+viewed on the host and resolves inside the user's server. Because it is created
+under the user's already-mounted data directory, it appears in an **already
+running** server — no restart needed, as Jupyter caches no filesystem state.
+
+### POST `/api/v1/pilot-export/run`
+
+Forces an export without waiting for the nightly schedule.
+
+```json
+{ "partners": ["REA"] }          // omit or null for all seven
+```
+
+Returns `202` and runs in the background. Add `?wait=true` to block for the
+results — only sensible for small partners. For a big one, prefer the CLI in
+the scheduler container so the work stays out of the API container:
+
+```bash
+docker compose exec pilot-export-scheduler python -m app.export_cli CEDER
+```
+
+### GET `/api/v1/pilot-export/status`
+
+Per-partner size and timestamp of the last successful export, plus free space
+on the shared volume.
+
+## Pilot datasets
+
+Pilot data is platform-owned and byte-identical for every user, so there is
+**one copy on disk**, not one per user. Copying CEDER (~127M rows) per user
+would cost several GB each time somebody clicks "add dataset".
+
+### Nightly export
+
+A separate container (`pilot-export-scheduler`) runs APScheduler's
+`BlockingScheduler`. For each partner it streams
+
+```
+COPY (SELECT ts_id, calendar_id, sensor_id, f_value, corrected
+      FROM public.f_tsdata) TO STDOUT WITH (FORMAT CSV, HEADER)
+```
+
+through gzip into `<PARTNER>.csv.gz.part`, uploads that file to MinIO, then
+`os.replace()`s it onto `<PARTNER>.csv.gz`. Nothing is ever held in memory —
+peak RSS is a few MB regardless of table size — and because the rename is
+atomic and same-directory, a user reading the file in a running notebook sees
+either the old complete export or the new one, never a truncated file.
+
+Why a separate container: a multi-GB export cannot block API request handling,
+and redeploying the API does not kill a running export. Why APScheduler rather
+than cron: the job stays in Python and reuses this repo's config, MinIO client
+and logging, while `max_instances=1` gives overlap prevention for free.
+
+Exports are **serialized** (single-worker executor) and staggered 45 minutes
+apart from 01:00, largest partner first:
+
+| 01:00 | 01:45 | 02:30 | 03:15 | 04:00 | 04:45 | 05:30 |
+|-------|-------|-------|-------|-------|-------|-------|
+| CEDER | RDN | BER | CEA | CARTIF | REA | ENGREEN |
+
+`misfire_grace_time` must stay larger than a full CEDER run, or partners queued
+behind it get dropped as misfires.
+
+One partner failing never aborts the others — each returns its own result, and
+a partner whose database has no `public.f_tsdata` yet (RDN, at the time of
+writing) fails cleanly and leaves the previous export in place.
+
+### Startup catch-up
+
+When the scheduler container starts it queues a one-off export for any partner
+whose file is missing or older than `PILOT_EXPORT_MAX_AGE_HOURS`, so a first
+deploy — or a restart after the VM was down overnight — produces data without
+waiting for 01:00.
+
+This is deliberately **conditional on staleness**, not unconditional. The
+container restarts on crash, on Docker daemon restart and on every redeploy;
+running exports on each of those would re-export CEDER (~127M rows) every time,
+hammer the CARTIF data lake, and drag a multi-GB job into the middle of the
+working day. With the age check, a crash loop or a routine redeploy finds fresh
+files and does nothing.
+
+Catch-up jobs go through the same single-worker executor as the cron jobs, so
+they can never run alongside a scheduled export. Set
+`PILOT_EXPORT_ON_STARTUP=false` to disable.
+
+Note this lives in the **scheduler** container. Restarting the API container
+(`data-management-server`) has no effect on exports — it never runs them.
+
+### Access
+
+`pilot_datasets/` is bind-mounted **read-only** into every singleuser container
+at `/home/jovyan/.pilot` by JupyterHub's `pre_spawn_hook`. That mount is a
+prerequisite for `POST /api/v1/provision/pilot` — without it the provisioned
+symlinks dangle inside the container too.
+
+In a notebook the file is read exactly as it looks:
+
+```python
+pd.read_csv('datasets/REA Pilot Data/REA.csv.gz')
+```
+
 ## Configuration
 
 All configuration is via environment variables (loaded from `.env`):
@@ -221,6 +358,18 @@ All configuration is via environment variables (loaded from `.env`):
 | `DATASETS_BUCKET` | `datasets` | MinIO bucket for datasets |
 | `NOTEBOOKS_BUCKET` | `notebooks` | MinIO bucket for notebooks |
 | `PILOT_PREFIX` | `user_pilot` | Prefix for platform/pilot datasets (reserved, unused) |
+| `PILOT_DATASETS_PREFIX` | `pilot_datasets` | MinIO prefix **and** shared-dir name for the nightly pilot exports |
+| `PILOT_MOUNT_PATH` | `/home/jovyan/.pilot` | Where pilot data is mounted read-only in singleuser containers; must match JupyterHub's `pre_spawn_hook` |
+| `DATALAKE_HOST` | `srv9.cartif.es` | CARTIF data lake host (this VM's IP is allow-listed) |
+| `DATALAKE_PORT` | `60007` | CARTIF data lake port |
+| `DATALAKE_USER` | `readonlyaccess` | Read-only data lake account |
+| `DATALAKE_PASSWORD` | _(required for exports)_ | Data lake password — **never hardcode it** |
+| `PILOT_EXPORT_HOUR` / `PILOT_EXPORT_MINUTE` | `1` / `0` | First export slot of the night |
+| `PILOT_EXPORT_STAGGER_MINUTES` | `45` | Gap between consecutive partners |
+| `PILOT_EXPORT_MISFIRE_GRACE_TIME` | `14400` | How late a queued/missed export may still start (must exceed a full CEDER run) |
+| `PILOT_EXPORT_ON_STARTUP` | `true` | Catch up missing/stale partners when the scheduler container starts |
+| `PILOT_EXPORT_MAX_AGE_HOURS` | `36` | Age past which a partner is considered stale — keep it above the 24h cadence |
+| `PILOT_EXPORT_STARTUP_DELAY_SECONDS` | `60` | Delay before catch-up work begins |
 | `JUPYTERHUB_DATA_PATH` | `/jupyterhub_data` | Container path to shared JupyterHub data |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
@@ -230,7 +379,8 @@ All configuration is via environment variables (loaded from `.env`):
 
 ```bash
 sudo mkdir -p path/to/jupyterhub_data/datasets \
-              path/to/jupyterhub_data/notebooks
+              path/to/jupyterhub_data/notebooks \
+              path/to/jupyterhub_data/pilot_datasets
 ```
 
 ### 2. Generate a strong API key and set it in `.env`
@@ -240,16 +390,37 @@ openssl rand -hex 32
 # Paste the result as API_KEY in data_managment_server/.env
 ```
 
-### 3. Build and start the service
+### 3. Set `DATALAKE_PASSWORD` in `.env`
+
+Required by the export job. `.env` is gitignored; the password must not appear
+in source.
+
+### 4. Build and start the services
+
+Starts both the API and the `pilot-export-scheduler` container:
 
 ```bash
 cd path/to/data_managment_server
 docker compose up -d --build
 ```
 
-### 4. Restart JupyterHub to pick up the new config/volume
+### 5. Restart JupyterHub to pick up the new config/volume
+
+Required for pilot datasets — this is what adds the read-only `/home/jovyan/.pilot`
+mount. Users with a server already running must restart it once to get the new
+mount; after that, newly provisioned pilot datasets appear without a restart.
 
 ```bash
 cd path/to/energyguard/JupyterHub
 docker compose up -d --build
+```
+
+### 6. Seed the pilot exports
+
+The nightly schedule will fill these in on its own, but the first run is worth
+doing by hand:
+
+```bash
+docker compose exec pilot-export-scheduler python -m app.export_cli --all
+docker compose logs -f pilot-export-scheduler
 ```

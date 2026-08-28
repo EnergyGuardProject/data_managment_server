@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 from pathlib import Path
 
 from minio import Minio
@@ -12,10 +13,49 @@ logger = logging.getLogger(__name__)
 DATASET_DIR_MODE = 0o755
 DATASET_FILE_MODE = 0o644
 
+# Copy objects to disk in 8 MB chunks. Anything streamed is fine; the point is
+# that peak memory is this constant and not the object size.
+DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+
 
 def _set_mode(path: Path, mode: int) -> None:
     """Best-effort permission normalization for bind-mounted shared paths."""
     os.chmod(path, mode)
+
+
+def download_object_atomic(
+    client: Minio, bucket: str, object_name: str, dest_file: Path, *, mode: int
+) -> None:
+    """Stream one object to *dest_file*, appearing only once complete.
+
+    Two things this deliberately does not do:
+
+    * It never materializes the object in memory. The previous
+      ``dest_file.write_bytes(response.read())`` allocated the whole object as
+      a single bytes object, which OOMs the container on pilot exports
+      (CEDER is ~500 MB gzipped) and needlessly spikes RSS on ordinary ones.
+    * It never writes to *dest_file* directly. The destination sits in a
+      directory bind-mounted into running JupyterHub containers, so a
+      partially written file is immediately visible to users and reads back
+      truncated. Writing to ``<name>.part`` in the same directory and then
+      ``os.replace``-ing makes the swap atomic — readers see the old file or
+      the new one, never a mixture.
+    """
+    tmp_file = dest_file.with_name(dest_file.name + ".part")
+    response = None
+    try:
+        response = client.get_object(bucket, object_name)
+        with open(tmp_file, "wb") as fh:
+            shutil.copyfileobj(response, fh, DOWNLOAD_CHUNK_BYTES)
+        _set_mode(tmp_file, mode)
+        os.replace(tmp_file, dest_file)
+    except BaseException:
+        tmp_file.unlink(missing_ok=True)
+        raise
+    finally:
+        if response is not None:
+            response.close()
+            response.release_conn()
 
 
 def get_minio_client() -> Minio:
@@ -108,13 +148,13 @@ def download_dataset_to_cache(
             continue
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         _set_mode(dest_file.parent, DATASET_DIR_MODE)
-        response = client.get_object(settings.datasets_bucket, obj.object_name)
-        try:
-            dest_file.write_bytes(response.read())
-        finally:
-            response.close()
-            response.release_conn()
-        _set_mode(dest_file, DATASET_FILE_MODE)
+        download_object_atomic(
+            client,
+            settings.datasets_bucket,
+            obj.object_name,
+            dest_file,
+            mode=DATASET_FILE_MODE,
+        )
         downloaded.append(relative_name)
 
     if not downloaded and not any(dest_dir.iterdir()):

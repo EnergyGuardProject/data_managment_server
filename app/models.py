@@ -24,6 +24,41 @@ class ProvisionRequest(BaseModel):
     force_notebook_refresh: bool = False
 
 
+class PilotProvisionRequest(BaseModel):
+    """Sent by the dashboard when a user adds a pilot dataset to their workspace.
+
+    Pilot data is platform-owned and byte-identical for everyone, so it is not
+    copied per user — the endpoint links the single shared copy into the user's
+    datasets directory. See app/routers/provision.py.
+    """
+
+    # The user's EMAIL. JupyterHub identifies users by email (Keycloak OIDC),
+    # and the per-user directories on disk are named by it.
+    username: str
+    # Partner code: one of app.pilots.PARTNERS (e.g. "RDN").
+    partner: str
+    # The folder name the user sees under ~/datasets/.
+    dataset_name: str
+
+
+class PilotExportRequest(BaseModel):
+    """Force a pilot export without waiting for the nightly schedule."""
+
+    # Partner codes to export. Omit or pass null to export all seven.
+    partners: Optional[list[str]] = None
+
+
+class PilotExportSummary(BaseModel):
+    partner: str
+    ok: bool
+    rows: Optional[int] = None
+    compressed_bytes: Optional[int] = None
+    duration_seconds: float
+    minio_object: Optional[str] = None
+    local_path: Optional[str] = None
+    errors: list[str] = Field(default_factory=list)
+
+
 class DatasetUpdateRequest(BaseModel):
     """Trigger an in-place update of one dataset for every user that has it."""
 
