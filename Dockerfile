@@ -1,8 +1,5 @@
 FROM python:3.12-slim
 
-# Non-root user for security
-RUN useradd --create-home --shell /bin/bash appuser
-
 WORKDIR /app
 
 # Install dependencies first (layer caching)
@@ -13,10 +10,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 
 # The shared JupyterHub data directory is bind-mounted at /jupyterhub_data at
-# runtime.  Create the mount-point so Docker doesn't auto-create it as root.
-RUN mkdir -p /jupyterhub_data && chown appuser:appuser /jupyterhub_data
-
-USER appuser
+# runtime. Runs as root so chmod on dirs created by JupyterHub's (also-root)
+# pre_spawn_hook succeeds — see _set_mode in app/routers/provision.py.
+RUN mkdir -p /jupyterhub_data
 
 EXPOSE 6060
 

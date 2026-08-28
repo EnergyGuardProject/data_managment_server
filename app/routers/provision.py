@@ -39,8 +39,17 @@ NOTEBOOK_FILE_MODE = 0o666
 
 
 def _set_mode(path: Path, mode: int) -> None:
-    """Best-effort permission normalization for bind-mounted shared paths."""
-    os.chmod(path, mode)
+    """Best-effort permission normalization for bind-mounted shared paths.
+
+    Shared dirs may already exist and be owned by another service (e.g.
+    JupyterHub's pre_spawn_hook runs as root and creates the same per-user
+    dirs). A chmod EPERM in that case is expected and non-fatal — the hook
+    already set the intended mode.
+    """
+    try:
+        os.chmod(path, mode)
+    except PermissionError as exc:
+        logger.warning("chmod %o on %s skipped: %s", mode, path, exc)
 
 
 @router.post("/user", response_model=ProvisionResult, summary="Provision datasets and notebooks for a JupyterHub user")
