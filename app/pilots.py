@@ -1,7 +1,8 @@
 """Registry of the seven EnergyGuard pilot partners.
 
-Each partner has its own database in the CARTIF data lake, and one object per
-partner in MinIO under ``<pilot_datasets_prefix>/<PARTNER>/<PARTNER>.csv.gz``.
+Each partner has its own database in the CARTIF data lake, one gzipped object
+per partner in MinIO under ``<pilot_datasets_prefix>/<PARTNER>/<PARTNER>.csv.gz``
+and one Parquet file per partner in the shared JupyterHub directory.
 The dashboard sends the bare partner code (e.g. ``"RDN"``); everything else in
 this codebase derives from this table.
 """
@@ -37,4 +38,5 @@ def pilot_object_name(partner: str) -> str:
 
 
 def pilot_file_name(partner: str) -> str:
-    return f"{partner}.csv.gz"
+    """File name in the shared JupyterHub directory."""
+    return f"{partner}.parquet"

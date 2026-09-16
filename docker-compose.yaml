@@ -20,7 +20,7 @@ services:
       - nginxproxy_energyguard_net
     # Other containers can still reach it at http://data-management-server:6060
 
-  # Nightly pilot exports (CARTIF data lake -> gzip -> MinIO + shared dir).
+  # Nightly pilot exports (CARTIF data lake -> gzip CSV -> MinIO, Parquet -> shared dir).
   #
   # Same image, different command. Kept out of the API container on purpose:
   #   * a multi-GB CEDER export cannot compete with request handling for the

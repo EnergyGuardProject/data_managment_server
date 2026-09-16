@@ -17,7 +17,8 @@ class Settings(BaseSettings):
 
     # Prefix in the datasets bucket holding the nightly pilot exports, laid out
     # as <pilot_datasets_prefix>/<PARTNER>/<PARTNER>.csv.gz. The dashboard reads
-    # the same layout, so changing it here means changing it there too.
+    # the same layout, so changing it here means changing it there too. The
+    # shared JupyterHub directory uses the same name, holding <PARTNER>.parquet.
     pilot_datasets_prefix: str = "pilot_datasets"
 
     # Path inside the DMS container that maps to the JupyterHub shared data dir.

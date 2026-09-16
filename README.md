@@ -1,4 +1,4 @@
-# EnergyGuard Data Management Server (DMS)
+# EnergyGuard Data Provisioning Server (DPS)
 
 Internal FastAPI service that sits between the dashboard and JupyterHub.
 It provisions datasets and notebook files into each
@@ -9,7 +9,7 @@ user's JupyterHub home directory.
 ```
                                                                                      |────── Data lake (future)
                                                                                      |
-Dashboard backend  ──POST /api/v1/provision/user──▶  Data Management Server  ◀──────┴───── MinIO
+Dashboard backend  ──POST /api/v1/provision/user──▶  Data Provisioning Server  ◀────┴───── MinIO
                                                         │
                                                         │
                                                         ▼
@@ -47,25 +47,25 @@ Bucket: notebooks
 Datasets support **multiple files** per dataset. All files under the
 `user_{username}/{dataset_name}/` prefix are treated as part of that dataset.
 
-Pilot exports are the exception — exactly one gzipped CSV per partner, refreshed
-nightly from the CARTIF data lake. See [Pilot datasets](#pilot-datasets).
+Pilot exports are the exception — exactly one gzipped CSV per partner in MinIO
+(one Parquet file in JupyterHub), refreshed nightly from the CARTIF data lake. See [Pilot datasets](#pilot-datasets).
 
 ## JupyterHub user home layout (after provisioning)
 
 ```
 /home/jovyan/
 ├── work/          ← persisted named volume (user's own work)
-│   ├── datasets/  ← read-only bind-mount (provisioned by DMS)
+│   ├── datasets/  ← read-only bind-mount (provisioned by DPS)
 │   │   ├── dataset_xx/
 │   │   │   ├── file1.csv
 │   │   │   └── metadata.json
 │   │   ├── dataset_yy/
 │   │   └── REA Pilot Data → /home/jovyan/.pilot/REA   ← symlink, not a copy
-│   └── notebooks/ ← read-write bind-mount (provisioned by DMS once)
+│   └── notebooks/ ← read-write bind-mount (provisioned by DPS once)
 │       ├── notebook_1.ipynb
 │       └── notebook_2.ipynb
 └── .pilot/        ← read-only bind-mount, ONE shared copy for all users
-    ├── REA/REA.csv.gz
+    ├── REA/REA.parquet
     └── …
 ```
 
@@ -79,7 +79,7 @@ Host file system layout (mounted into JupyterHub containers):
 ├── notebooks/
 │   └── {username}/            ← provisioned once per user (0o777 / files 0o666)
 └── pilot_datasets/
-    └── {PARTNER}/{PARTNER}.csv.gz   ← nightly export (0o755 / files 0o644)
+    └── {PARTNER}/{PARTNER}.parquet  ← nightly export (0o755 / files 0o644)
 ```
 
 ## API Endpoints
@@ -279,12 +279,16 @@ A separate container (`pilot-export-scheduler`) runs APScheduler's
 `BlockingScheduler`. For each partner it streams
 
 ```
-COPY (SELECT ts_id, calendar_id, sensor_id, f_value, corrected
-      FROM public.f_tsdata) TO STDOUT WITH (FORMAT CSV, HEADER)
+COPY (SELECT <calendar_id decoded> AS datetime, sensor_id,
+             f_value AS "values", corrected
+      FROM public.f_tsdata
+      ORDER BY sensor_id, calendar_id) TO STDOUT WITH (FORMAT CSV, HEADER)
 ```
 
-through gzip into `<PARTNER>.csv.gz.part`, uploads that file to MinIO, then
-`os.replace()`s it onto `<PARTNER>.csv.gz`. Nothing is ever held in memory —
+through gzip into the hidden temp file `.<PARTNER>.csv.gz.part`. That file is
+converted in streaming batches into `.<PARTNER>.parquet.part`, then uploaded to
+MinIO as `<PARTNER>.csv.gz`, and the Parquet file is `os.replace()`d onto
+`<PARTNER>.parquet` in the shared dir. Nothing is ever held in memory —
 peak RSS is a few MB regardless of table size — and because the rename is
 atomic and same-directory, a user reading the file in a running notebook sees
 either the old complete export or the new one, never a truncated file.
@@ -336,11 +340,34 @@ at `/home/jovyan/.pilot` by JupyterHub's `pre_spawn_hook`. That mount is a
 prerequisite for `POST /api/v1/provision/pilot` — without it the provisioned
 symlinks dangle inside the container too.
 
-In a notebook the file is read exactly as it looks:
+JupyterHub gets Parquet rather than CSV: every partner's CSV is too large for
+JupyterLab's CSV viewer anyway (CEDER is ~9 GB), and Parquet is typed, much
+smaller, and can be read one sensor at a time. In a notebook:
 
 ```python
-pd.read_csv('datasets/REA Pilot Data/REA.csv.gz')
+df = pd.read_parquet('datasets/REA Pilot Data/REA.parquet')
+
+# One sensor only — skips the rest of the file:
+pd.read_parquet('datasets/CEDER Pilot Data/CEDER.parquet',
+                filters=[('sensor_id', '==', 'ACTARIS')])
 ```
+
+MinIO (and so the dashboard download) keeps the gzipped CSV.
+
+### File format
+
+Same columns in both copies; the Parquet types are in brackets.
+
+| Column | Source | Notes |
+|--------|--------|-------|
+| `datetime` (timestamp, s) | `f_tsdata.calendar_id` | `YYYY-MM-DD HH:MM:SS` in the CSV, no time zone (the data lake stores none). `calendar_id` is `YYYYMMDDHHMMSS` for CEDER/CEA and `YYYYMMDDHHMM` for the other partners; both are decoded |
+| `sensor_id` (string) | `f_tsdata.sensor_id` | Unchanged; kept as a string so all-digit ids (REA) keep their leading zeros |
+| `values` (float64) | `f_tsdata.f_value` | Reading |
+| `corrected` (bool) | `f_tsdata.corrected` | `true` if the value was imputed by the data quality corrector rather than measured (D3.1 §3.4) |
+
+Rows are sorted by `sensor_id`, then `datetime`. `f_tsdata.ts_id` is not
+exported: it is only the data lake's row key, has gaps, and does not follow
+time.
 
 ## Configuration
 

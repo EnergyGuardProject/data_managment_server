@@ -2,17 +2,22 @@
 
 Pipeline, per partner, with nothing ever held in memory:
 
-    Postgres COPY … TO STDOUT  ->  gzip  ->  <PARTNER>.csv.gz.part
-                                                |
-                            +-------------------+-------------------+
-                            |                                       |
-                   MinIO fput_object                        os.replace() onto
-            pilot_datasets/<P>/<P>.csv.gz                   <P>.csv.gz
+    Postgres COPY … TO STDOUT  ->  gzip  ->  .<P>.csv.gz.part  ->  MinIO fput_object
+                                                  |               pilot_datasets/<P>/<P>.csv.gz
+                                   streaming CSV reader (batches)
+                                                  |
+                                    .<P>.parquet.part  ->  os.replace() onto <P>.parquet
 
-The single temp file doubles as the upload source and as the atomic-rename
-source. It lives in the *same directory* as its final name so ``os.replace``
-is a same-filesystem rename — JupyterHub users therefore only ever see the
-previous complete export or the new complete export, never a partial one.
+The data lake is read once. MinIO keeps a gzipped CSV (the dashboard serves
+and previews that key); JupyterHub users get Parquet, converted from that same
+local file. Even the smallest partner is too large as CSV for JupyterLab's
+viewer, and CEDER is ~9 GB of CSV, while Parquet is typed, a fraction of the
+size, and lets pandas read a single sensor without loading the whole file.
+
+The temp files are dot-prefixed, so Jupyter hides them, and live in the *same
+directory* as the final name so ``os.replace`` is a same-filesystem rename —
+JupyterHub users therefore only ever see the previous complete export or the
+new complete export, never a partial one.
 That matters because the shared directory is bind-mounted straight into
 running singleuser containers: a non-atomic write is visible byte-by-byte in
 the Jupyter file browser and produces truncated ``pd.read_csv`` results.
@@ -35,6 +40,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg2
+import pyarrow as pa
+import pyarrow.csv as pa_csv
+import pyarrow.parquet as pq
 
 from app.config import settings
 from app.pilots import (
@@ -52,13 +60,67 @@ from app.services.minio_client import (
 
 logger = logging.getLogger(__name__)
 
-# The full raw fact table, exactly as the dashboard expects it.
-EXPORT_COLUMNS = "ts_id, calendar_id, sensor_id, f_value, corrected"
 SOURCE_TABLE = "public.f_tsdata"
-COPY_SQL = (
-    f"COPY (SELECT {EXPORT_COLUMNS} FROM {SOURCE_TABLE}) "
-    "TO STDOUT WITH (FORMAT CSV, HEADER)"
-)
+
+
+def _calendar_to_timestamp(digits: int) -> str:
+    """SQL turning a *digits*-long ``calendar_id`` into a ``timestamp``.
+
+    ``calendar_id`` is a packed bigint, and its width differs per partner:
+    CEDER and CEA store ``YYYYMMDDHHMMSS`` (14 digits), the others
+    ``YYYYMMDDHHMM`` (12). Integer arithmetic plus ``make_timestamp`` is much
+    cheaper per row than a ``to_timestamp`` string parse or a join against
+    ``d_calendar``, and yields a zone-less timestamp, so the session TimeZone
+    cannot shift or DST-gap the values. The source carries no zone, so none is
+    invented here.
+    """
+    seconds = "calendar_id % 100" if digits == 14 else "0"
+    base = "calendar_id / 100" if digits == 14 else "calendar_id"
+    return (
+        f"make_timestamp(({base} / 100000000)::int, "
+        f"({base} / 1000000 % 100)::int, ({base} / 10000 % 100)::int, "
+        f"({base} / 100 % 100)::int, ({base} % 100)::int, "
+        f"({seconds})::double precision)"
+    )
+
+
+# The raw fact table reshaped for people opening the file cold:
+# * ts_id is dropped — it is only the fact table's surrogate row key, with gaps
+#   and no relation to time; sensor_id + datetime identify a reading.
+# * calendar_id is decoded to a real datetime.
+# * `corrected` is kept even though it is false everywhere today: it is how the
+#   data quality corrector (D3.1 §3.4) labels imputed values, so dropping it
+#   would silently mix generated readings with measured ones.
+# * Rows are ordered per sensor, then in time. calendar_id has a fixed width
+#   within a partner, so ordering by it is ordering by datetime, and it lets
+#   Postgres use the (sensor_id, calendar_id, ts_id) index.
+EXPORT_SELECT = f"""
+SELECT CASE length(calendar_id::text)
+            WHEN 14 THEN {_calendar_to_timestamp(14)}
+            WHEN 12 THEN {_calendar_to_timestamp(12)}
+       END AS datetime,
+       sensor_id,
+       f_value AS "values",
+       -- COPY writes booleans as t/f; spell them out so pandas reads a bool.
+       corrected::text AS corrected
+FROM {SOURCE_TABLE}
+ORDER BY sensor_id, calendar_id
+"""
+COPY_SQL = f"COPY ({EXPORT_SELECT}) TO STDOUT WITH (FORMAT CSV, HEADER)"
+
+# Column types for the Parquet file. Spelled out rather than inferred: REA's
+# sensor ids are all digits ("01000632023001") and would otherwise become
+# integers, losing their leading zeros.
+PARQUET_SCHEMA = pa.schema([
+    ("datetime", pa.timestamp("s")),
+    ("sensor_id", pa.string()),
+    ("values", pa.float64()),
+    ("corrected", pa.bool_()),
+])
+# CSV bytes parsed per batch; each batch becomes one Parquet row group. Rows
+# are sorted by sensor, so a row group's sensor_id min/max statistics let
+# pd.read_parquet(filters=...) skip most of the file.
+_PARQUET_BLOCK_BYTES = 64 * 1024 * 1024
 
 # Log a progress line roughly every 250 MB of compressed output so a multi-hour
 # CEDER run is observable without spamming the log.
@@ -89,10 +151,10 @@ class _GzipSink:
     that detection. Also tracks compressed size for progress logging.
     """
 
-    def __init__(self, gz: gzip.GzipFile, partner: str, raw_fh) -> None:
+    def __init__(self, gz: gzip.GzipFile, partner: str, gz_raw_fh) -> None:
         self._gz = gz
         self._partner = partner
-        self._raw_fh = raw_fh
+        self._gz_raw_fh = gz_raw_fh
         self._next_progress = _PROGRESS_INTERVAL_BYTES
 
     def write(self, data) -> int:
@@ -103,7 +165,7 @@ class _GzipSink:
         return written
 
     def _maybe_log_progress(self) -> None:
-        compressed = self._raw_fh.tell()
+        compressed = self._gz_raw_fh.tell()
         if compressed >= self._next_progress:
             logger.info(
                 "[%s] export in progress: %.1f MB compressed so far",
@@ -172,8 +234,14 @@ def _connect(partner: str):
     return conn
 
 
-def _stream_copy_to_gzip(partner: str, tmp_path: Path) -> int:
-    """Run the COPY into *tmp_path* as gzip. Returns the row count.
+def _fsync_close(fh) -> None:
+    fh.flush()
+    os.fsync(fh.fileno())
+    fh.close()
+
+
+def _stream_copy_to_gzip(partner: str, gz_path: Path) -> int:
+    """Run the COPY into *gz_path* as gzip. Returns the row count.
 
     Everything between the server and the file is a stream: psycopg2 pushes
     COPY chunks into the gzip compressor, which pushes into the file. Peak RSS
@@ -186,6 +254,9 @@ def _stream_copy_to_gzip(partner: str, tmp_path: Path) -> int:
                 "SET statement_timeout = %s",
                 (settings.datalake_statement_timeout_ms,),
             )
+            # Pin timestamp output to "YYYY-MM-DD HH:MM:SS" whatever the
+            # server's default DateStyle is.
+            cur.execute("SET DateStyle = 'ISO, YMD'")
             cur.execute("SELECT to_regclass(%s)", (SOURCE_TABLE,))
             if cur.fetchone()[0] is None:
                 raise PartnerExportError(
@@ -193,24 +264,51 @@ def _stream_copy_to_gzip(partner: str, tmp_path: Path) -> int:
                     "(partner not onboarded yet)"
                 )
 
-            with open(tmp_path, "wb") as raw_fh:
+            with open(gz_path, "wb") as gz_raw_fh:
                 gz = gzip.GzipFile(
-                    filename=pilot_file_name(partner)[: -len(".gz")],
+                    filename=f"{partner}.csv",
                     mode="wb",
-                    fileobj=raw_fh,
+                    fileobj=gz_raw_fh,
                     compresslevel=settings.pilot_export_gzip_level,
                 )
                 try:
-                    cur.copy_expert(COPY_SQL, _GzipSink(gz, partner, raw_fh))
+                    cur.copy_expert(COPY_SQL, _GzipSink(gz, partner, gz_raw_fh))
                 finally:
                     gz.close()
-                raw_fh.flush()
-                os.fsync(raw_fh.fileno())
+                _fsync_close(gz_raw_fh)
 
             # psycopg2 populates rowcount from the COPY command tag.
             return cur.rowcount
     finally:
         conn.close()
+
+
+def _gzip_csv_to_parquet(gz_path: Path, parquet_path: Path) -> int:
+    """Convert the exported gzipped CSV into Parquet. Returns the row count.
+
+    Streams batch by batch, so memory is bounded by one batch (a few hundred
+    MB at most) rather than by the table.
+    """
+    rows = 0
+    reader = pa_csv.open_csv(
+        pa.input_stream(str(gz_path), compression="gzip"),
+        read_options=pa_csv.ReadOptions(block_size=_PARQUET_BLOCK_BYTES),
+        convert_options=pa_csv.ConvertOptions(
+            column_types=PARQUET_SCHEMA,
+            include_columns=PARQUET_SCHEMA.names,
+            true_values=["true"],
+            false_values=["false"],
+        ),
+    )
+    with open(parquet_path, "wb") as fh:
+        with pq.ParquetWriter(fh, PARQUET_SCHEMA, compression="zstd") as writer:
+            for batch in reader:
+                writer.write_table(
+                    pa.Table.from_batches([batch]).cast(PARQUET_SCHEMA)
+                )
+                rows += batch.num_rows
+        _fsync_close(fh)
+    return rows
 
 
 def export_partner(partner: str, *, minio_client=None) -> ExportResult:
@@ -230,7 +328,8 @@ def export_partner(partner: str, *, minio_client=None) -> ExportResult:
 
     dest_dir = _pilot_base_dir() / canonical
     final_path = dest_dir / pilot_file_name(canonical)
-    tmp_path = final_path.with_name(final_path.name + ".part")
+    parquet_tmp = dest_dir / f".{final_path.name}.part"
+    gz_tmp = dest_dir / f".{canonical}.csv.gz.part"
 
     try:
         with _partner_lock(canonical):
@@ -243,9 +342,16 @@ def export_partner(partner: str, *, minio_client=None) -> ExportResult:
                 canonical, SOURCE_TABLE, PARTNER_DATABASES[canonical],
             )
             try:
-                rows = _stream_copy_to_gzip(canonical, tmp_path)
+                rows = _stream_copy_to_gzip(canonical, gz_tmp)
+                parquet_rows = _gzip_csv_to_parquet(gz_tmp, parquet_tmp)
+                if rows is not None and rows >= 0 and parquet_rows != rows:
+                    raise PartnerExportError(
+                        f"Parquet has {parquet_rows:,} rows but COPY "
+                        f"returned {rows:,}"
+                    )
             except Exception:
-                tmp_path.unlink(missing_ok=True)
+                parquet_tmp.unlink(missing_ok=True)
+                gz_tmp.unlink(missing_ok=True)
                 # Leave no empty partner directory behind on a first-time
                 # failure: an empty folder in the file browser reads as "this
                 # dataset is empty", a missing one as "not available yet".
@@ -258,8 +364,8 @@ def export_partner(partner: str, *, minio_client=None) -> ExportResult:
                 raise
 
             result.rows = rows if rows is not None and rows >= 0 else None
-            result.compressed_bytes = tmp_path.stat().st_size
-            _set_mode(tmp_path, DATASET_FILE_MODE)
+            result.compressed_bytes = gz_tmp.stat().st_size
+            _set_mode(parquet_tmp, DATASET_FILE_MODE)
 
             # ── Destination 1: MinIO ──────────────────────────────────────
             # fput_object streams from disk; it does not read the file in.
@@ -269,7 +375,7 @@ def export_partner(partner: str, *, minio_client=None) -> ExportResult:
                 client.fput_object(
                     settings.datasets_bucket,
                     object_name,
-                    str(tmp_path),
+                    str(gz_tmp),
                     content_type="application/gzip",
                 )
                 result.minio_object = object_name
@@ -278,11 +384,17 @@ def export_partner(partner: str, *, minio_client=None) -> ExportResult:
                 # publish to the shared dir anyway and report the failure.
                 logger.error("[%s] MinIO upload failed: %s", canonical, exc)
                 result.errors.append(f"MinIO upload failed: {exc}")
+            finally:
+                gz_tmp.unlink(missing_ok=True)
 
             # ── Destination 2: shared JupyterHub dir (atomic) ─────────────
-            os.replace(tmp_path, final_path)
+            os.replace(parquet_tmp, final_path)
             _set_mode(final_path, DATASET_FILE_MODE)
             result.local_path = str(final_path)
+            # Exports used to be published here as CSV (earlier still, gzipped
+            # CSV); drop those so users do not find the same data twice.
+            for legacy in (f"{canonical}.csv", f"{canonical}.csv.gz"):
+                (dest_dir / legacy).unlink(missing_ok=True)
 
             result.ok = not result.errors
     except PartnerExportError as exc:

@@ -10,3 +10,6 @@ httpx==0.27.2
 # psycopg2-binary ships its own libpq, so the image needs no build deps.
 psycopg2-binary==2.9.10
 APScheduler==3.10.4
+# Parquet for the JupyterHub copy of the pilot exports. Same version as the
+# JupyterHub singleuser image.
+pyarrow==22.0.0
