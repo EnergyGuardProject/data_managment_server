@@ -2,7 +2,7 @@
 
 Internal FastAPI service that sits between the dashboard and JupyterHub.
 It provisions datasets and notebook files into each user's JupyterHub home
-directory and exports the pilot partner data from the CARTIF data lake every
+directory and exports the pilot partner data from the EnergyGuard data lake every
 night.
 
 The repository runs two containers from the same image.
@@ -19,7 +19,7 @@ Dashboard backend ──POST /api/v1/provision/*──▶ data-management-server
                                                         │                      ▲
                                                         ▼                      │ <PARTNER>.csv.gz
                                                      Host FS                   │
-                                   /mnt/datadisk/volumes/jupyterhub_data ◀── pilot-export-scheduler ◀── CARTIF data lake
+                                   /mnt/datadisk/volumes/jupyterhub_data ◀── pilot-export-scheduler ◀── EnergyGuard data lake
                                                         │                   <PARTNER>.parquet
                           ┌─────────────────────────────┼──────────────────────────────┐
                           ▼                             ▼                              ▼
@@ -311,7 +311,7 @@ is one copy on disk for everyone. Users get symlinks to it through
 
 The `pilot-export-scheduler` container runs an APScheduler
 `BlockingScheduler`. For each partner it streams the following query from the
-partner's database in the CARTIF data lake.
+partner's database in the EnergyGuard data lake.
 
 ```
 COPY (SELECT <calendar_id decoded> AS datetime, sensor_id,
