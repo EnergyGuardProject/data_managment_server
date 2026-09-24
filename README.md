@@ -1,85 +1,93 @@
-# EnergyGuard Data Provisioning Server (DPS)
+# EnergyGuard Data Provisioning Server
 
 Internal FastAPI service that sits between the dashboard and JupyterHub.
-It provisions datasets and notebook files into each
-user's JupyterHub home directory.
+It provisions datasets and notebook files into each user's JupyterHub home
+directory and exports the pilot partner data from the CARTIF data lake every
+night.
+
+The repository runs two containers from the same image.
+
+| Container | Command | Purpose |
+|-----------|---------|---------|
+| `data-management-server` | `uvicorn app.main:app` | The HTTP API on port 6060 |
+| `pilot-export-scheduler` | `python -m app.scheduler` | Nightly pilot exports |
 
 ## Architecture
 
 ```
-                                                                                     |────── Data lake (future)
-                                                                                     |
-Dashboard backend  ──POST /api/v1/provision/user──▶  Data Provisioning Server  ◀────┴───── MinIO
-                                                        │
-                                                        │
-                                                        ▼
-                                                      Host FS              
-                                               /jupyterhub_data 
-                                                        │
-                                          ┌─────────────┴──────────────┐
-                                          ▼                            ▼
-                               /home/jovyan/datasets         /home/jovyan/notebooks
-                               (read-only bind-mount)       (read-write bind-mount)
-                               in singleuser container       in singleuser container
+Dashboard backend ──POST /api/v1/provision/*──▶ data-management-server ◀──── MinIO
+                                                        │                      ▲
+                                                        ▼                      │ <PARTNER>.csv.gz
+                                                     Host FS                   │
+                                   /mnt/datadisk/volumes/jupyterhub_data ◀── pilot-export-scheduler ◀── CARTIF data lake
+                                                        │                   <PARTNER>.parquet
+                          ┌─────────────────────────────┼──────────────────────────────┐
+                          ▼                             ▼                              ▼
+             /home/jovyan/work/datasets    /home/jovyan/work/notebooks        /home/jovyan/.pilot
+             (read-only bind mount)        (read-write bind mount)            (read-only bind mount)
+                                     in each singleuser container
 ```
 
 ## MinIO layout
 
 ```
 Bucket: datasets
-└── user_<username>/
-    └── <dataset_name>/
-        ├── file1.csv
-        ├── file2.csv
-        └── metadata.json        ← optional
-
-Bucket: datasets — pilot exports (written by the nightly job)
-└── pilot_datasets/             ← PILOT_DATASETS_PREFIX
+├── user_<username>/
+│   └── <dataset_name>/
+│       ├── file1.csv
+│       ├── file2.csv
+│       └── metadata.json        ← optional
+└── pilot_datasets/              ← PILOT_DATASETS_PREFIX, written by 
     ├── RDN/RDN.csv.gz
     ├── CEDER/CEDER.csv.gz
-    └── …                       ← one object per partner
+    └── …                        ← one object per partner
 
 Bucket: notebooks
 ├── notebook_1.ipynb
 └── notebook_2.ipynb
 ```
 
-Datasets support **multiple files** per dataset. All files under the
-`user_{username}/{dataset_name}/` prefix are treated as part of that dataset.
+A dataset can hold several files. Every object under the
+`user_{username}/{dataset_name}/` prefix belongs to that dataset.
 
-Pilot exports are the exception — exactly one gzipped CSV per partner in MinIO
-(one Parquet file in JupyterHub), refreshed nightly from the CARTIF data lake. See [Pilot datasets](#pilot-datasets).
+Pilot exports are different. Each partner has exactly one gzipped CSV in MinIO
+and one Parquet file in JupyterHub, both refreshed nightly from the EnergyGuard data
+lake. See [Pilot datasets](#pilot-datasets).
+
+Both buckets are created on API startup if they do not exist.
 
 ## JupyterHub user home layout (after provisioning)
 
 ```
 /home/jovyan/
 ├── work/          ← persisted named volume (user's own work)
-│   ├── datasets/  ← read-only bind-mount (provisioned by DPS)
+│   ├── datasets/  ← read-only bind mount (provisioned by this service)
 │   │   ├── dataset_xx/
 │   │   │   ├── file1.csv
 │   │   │   └── metadata.json
 │   │   ├── dataset_yy/
 │   │   └── REA Pilot Data → /home/jovyan/.pilot/REA   ← symlink, not a copy
-│   └── notebooks/ ← read-write bind-mount (provisioned by DPS once)
+│   └── notebooks/ ← read-write bind mount (provisioned once)
 │       ├── notebook_1.ipynb
 │       └── notebook_2.ipynb
-└── .pilot/        ← read-only bind-mount, ONE shared copy for all users
+└── .pilot/        ← read-only bind mount, one shared copy for all users
     ├── REA/REA.parquet
     └── …
 ```
 
-Host file system layout (mounted into JupyterHub containers):
+Host file system layout. The host directory is
+`/mnt/datadisk/volumes/jupyterhub_data` and both containers mount it at
+`/jupyterhub_data`.
 
 ```
 /jupyterhub_data/
 ├── datasets/
 │   └── {username}/
-│       └── {dataset_name}/    ← synced from MinIO (0o755 / files 0o644)
+│       └── {dataset_name}/    ← synced from MinIO 
 ├── notebooks/
-│   └── {username}/            ← provisioned once per user (0o777 / files 0o666)
+│   └── {username}/            ← provisioned once per user
 └── pilot_datasets/
-    └── {PARTNER}/{PARTNER}.parquet  ← nightly export (0o755 / files 0o644)
+    └── {PARTNER}/{PARTNER}.parquet  ← nightly export 
 ```
 
 ## API Endpoints
@@ -87,26 +95,30 @@ Host file system layout (mounted into JupyterHub containers):
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/api/v1/datasets` | List datasets (`?username=x` to filter by owner) |
-| `POST` | `/api/v1/datasets/update` | Re-download a dataset for all users that have it cached (mainly for pilot datasets in the future) |
+| `POST` | `/api/v1/datasets/update` | Re-download a dataset for every user that has it cached |
 | `GET`  | `/api/v1/notebooks` | List notebooks available in MinIO |
-| `POST` | `/api/v1/provision/user` | Provision datasets + notebooks for a user |
-| `DELETE` | `/api/v1/datasets/{username}/{dataset_name}` | Delete dataset from MinIO and local cache |
-| `DELETE` | `/api/v1/datasets/cache/{username}/{dataset_name}` | Delete dataset only from one user's JupyterHub cache (MinIO untouched) |
-| `POST` | `/api/v1/datasets/upload` | Upload one or more dataset files (+ optional metadata) to MinIO (for testing) |
-| `POST` | `/api/v1/datasets/metadata` | Upload/replace a dataset's metadata.json (for testing)|
+| `POST` | `/api/v1/provision/user` | Provision datasets and notebooks for a user |
+| `POST` | `/api/v1/provision/pilot` | Link a pilot dataset into a user's datasets directory |
+| `DELETE` | `/api/v1/datasets/{username}/{dataset_name}` | Delete a dataset from MinIO and from every user's cache |
+| `DELETE` | `/api/v1/datasets/cache/{username}/{dataset_name}` | Delete a dataset from one user's JupyterHub cache only (MinIO untouched) |
+| `POST` | `/api/v1/datasets/upload` | Upload one or more dataset files (and optional metadata) to MinIO (for testing) |
+| `POST` | `/api/v1/datasets/metadata` | Upload or replace a dataset's metadata file (for testing) |
+| `POST` | `/api/v1/pilot-export/run` | Start a pilot export now |
+| `GET`  | `/api/v1/pilot-export/status` | Show the pilot exports currently on disk |
 | `GET`  | `/health` | Health check |
 
-All endpoints (except `/health`) require an `X-API-Key` header.
+All endpoints except `/health` need an `X-API-Key` header. A missing or wrong
+key returns `403`.
 
 ### GET `/api/v1/datasets`
 
-Optional query param `?username=<owner>` filters to that owner's datasets.
-Returns a list of `DatasetInfo` objects:
+The optional query parameter `?username=<owner>` limits the list to that
+owner's datasets. Returns a list of `DatasetInfo` objects.
 
 ```json
 [
   {
-    "owner": "john_doe",
+    "owner": "user_john_doe",
     "name": "building_energy_2024",
     "files": ["readings.csv", "sensors.csv", "metadata.json"],
     "size_bytes": 204800
@@ -114,14 +126,15 @@ Returns a list of `DatasetInfo` objects:
 ]
 ```
 
+`owner` is the top level MinIO prefix, including `user_`.
+
 ### POST `/api/v1/datasets/update`
 
-Re-downloads a dataset from MinIO into the local cache for every user that
-currently has it. Stale local files (deleted from MinIO) are removed. In the 
-future, this will be used to update the pilot datasets that need to change 
-periodically using dagster.
+Downloads a dataset from MinIO again into the local cache of every user whose
+cache has a folder with that dataset name. Local files that no longer exist in
+MinIO are removed.
 
-Request body:
+Request body
 
 ```json
 { "dataset_owner": "john_doe", "dataset_name": "building_energy_2024" }
@@ -131,11 +144,12 @@ Returns `{"dataset_owner": "...", "dataset_name": "...", "users_updated": [...],
 
 ### GET `/api/v1/notebooks`
 
-Returns `[{"name": "notebook_1.ipynb", "size_bytes": 12345}, ...]`.
+Returns every `.ipynb` object in the notebooks bucket, for example
+`[{"name": "notebook_1.ipynb", "size_bytes": 12345}]`.
 
 ### POST `/api/v1/provision/user`
 
-When the dashboard redirects a user to JupyterHub, it should first call:
+The dashboard calls this before it redirects a user to JupyterHub.
 
 ```http
 POST http://data-management-server:6060/api/v1/provision/user
@@ -145,65 +159,96 @@ Content-Type: application/json
 {
   "username": "john_doe",
   "datasets": {
-    "aliki@gmail.com/temperature_2024": "alikis_dataset",
-    "pilot@pilot.com/raw_weather": "weather_data"
+    "user_aliki@gmail.com/temperature_2024": "alikis_dataset",
+    "user_pilot@pilot.com/raw_weather": "weather_data"
   },
-  "notebooks": null
+  "notebooks": null,
+  "force_notebook_refresh": false
 }
 ```
 
-- `datasets`: mapping of `dataset_minio_path` → `dataset_name`.
-  - `dataset_minio_path` is the bucket-relative prefix where the dataset
-    actually lives in MinIO (`<owner>/<original_dataset_name>`). 
-  - `dataset_name` is the name the user picked for the dataset (possibly
-    renamed via the dashboard). It is the folder name that the dataset will
-    be materialized under in JupyterHub at
-    `/home/jovyan/datasets/<dataset_name>/`. Because users can rename
-    datasets from the dashboard, `dataset_name` may differ from the original
-    name embedded in `dataset_minio_path`.
-- `notebooks`: `null` = provision ALL platform notebooks (skip if already present);
-  pass a list of names to provision specific ones; pass `[]` to skip notebooks entirely
-- `force_notebook_refresh`: set `true` to overwrite existing notebooks
+* `datasets` maps `dataset_minio_path` to `dataset_name`.
+  * `dataset_minio_path` is the bucket relative prefix of the dataset in MinIO,
+    in the form `user_<owner>/<original_dataset_name>`. The `user_` part is
+    optional.
+  * `dataset_name` is the name the user gave the dataset in the dashboard. The
+    dataset is stored under this folder name in JupyterHub at
+    `/home/jovyan/work/datasets/<dataset_name>/`. Users can rename datasets in
+    the dashboard, so it can differ from the name in `dataset_minio_path`.
+  * Files that already exist in the user's cache are kept. Only missing files
+    are downloaded.
+* `notebooks` set to `null` provisions every platform notebook that the user
+  does not already have. A list of names provisions only those notebooks, and
+  `[]` skips notebooks.
+* `force_notebook_refresh` set to `true` overwrites notebooks the user already
+  has.
 
-So in the example above, `john_doe`'s JupyterHub volume will end up with:
+With the request above, `john_doe` ends up with
 
 ```
-/home/jovyan/datasets/
+/home/jovyan/work/datasets/
 ├── alikis_dataset/   ← downloaded from user_aliki@gmail.com/temperature_2024
-└── weather_data/     ← downloaded from user_pilot/raw_weather
+└── weather_data/     ← downloaded from user_pilot@pilot.com/raw_weather
 ```
 
-Returns:
+and the response
 
 ```json
 {
   "username": "john_doe",
   "datasets_provisioned": [
-    "aliki@gmail.com/temperature_2024 -> alikis_dataset",
-    "user_pilot/raw_weather -> weather_data"
+    "user_aliki@gmail.com/temperature_2024 -> alikis_dataset",
+    "user_pilot@pilot.com/raw_weather -> weather_data"
   ],
   "notebooks_provisioned": ["notebook_1.ipynb"],
   "errors": []
 }
 ```
 
+A dataset that fails to download, or is empty in MinIO, is listed in `errors`.
+The other datasets and notebooks are still provisioned.
+
+### POST `/api/v1/provision/pilot`
+
+Gives a user access to a pilot dataset. The dashboard calls it.
+
+```json
+{ "username": "user@example.com", "partner": "RDN", "dataset_name": "RDN Pilot Data" }
+```
+
+`username` is the user's email. JupyterHub identifies users by email through
+Keycloak OIDC, and the per-user directories on disk use that name.
+
+`partner` must be one of `RDN CEDER BER CEA CARTIF REA ENGREEN` (case
+insensitive), otherwise the endpoint returns `404`. `username` and
+`dataset_name` must each be a single path component, otherwise it returns
+`400`. The call is idempotent, so the dashboard can call it on every page load.
+
+The endpoint creates a symlink and copies nothing.
+
+```
+/jupyterhub_data/datasets/{email}/{dataset_name}  ->  /home/jovyan/.pilot/{PARTNER}
+```
+
+The target is a path inside the singleuser container. 
+Returns the standard `ProvisionResult`.
+
 ### DELETE `/api/v1/datasets/{username}/{dataset_name}`
 
 Removes all objects under `user_{username}/{dataset_name}/` in MinIO and
-deletes any cached copies at `/jupyterhub_data/datasets/*/{dataset_name}/`.
+deletes every cached copy at `/jupyterhub_data/datasets/*/{dataset_name}/`.
 
 ### DELETE `/api/v1/datasets/cache/{username}/{dataset_name}`
 
 Removes only `/jupyterhub_data/datasets/{username}/{dataset_name}/` from the
-host cache. MinIO is **not** touched, and other users that have the same
-dataset cached are unaffected. `dataset_name` here is the local folder name
-as it appears in JupyterHub (which may be a user-chosen rename of the
-underlying MinIO dataset). Returns `404` if the user has no such cached
-dataset.
+host cache. MinIO is not touched, and other users with the same dataset cached
+are not affected. `dataset_name` is the local folder name as it appears in
+JupyterHub, which may be a rename of the MinIO dataset. Returns `404` if the
+user has no cached dataset with that name.
 
-### POST `/api/v1/datasets/upload` (for testing, this will be done via the dashboard)
+### POST `/api/v1/datasets/upload` (for testing)
 
-Multipart form fields:
+In production the dashboard uploads datasets. Multipart form fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -212,51 +257,40 @@ Multipart form fields:
 | `files` | file[] | yes | One or more files to upload |
 | `metadata` | file | no | JSON metadata file |
 
-Returns `{"status": "ok", "objects": ["user_x/ds/file1.csv", ...]}`.
+Files are stored under `user_{username}/{dataset_name}/` with their original
+file names. Returns `{"status": "ok", "objects": ["user_x/ds/file1.csv", ...]}`.
+Invalid metadata JSON returns `400`.
 
-### POST `/api/v1/datasets/metadata` (for testing, this will be done via the dashboard)
+### POST `/api/v1/datasets/metadata` (for testing)
 
-Multipart form fields: `username`, `dataset_name`, `metadata` (file).
-Validates that the uploaded file is valid JSON before storing.
-
-
-### POST `/api/v1/provision/pilot`
-
-Gives a user access to a pilot dataset. Called by the dashboard.
-
-```json
-{ "username": "user@example.com", "partner": "RDN", "dataset_name": "RDN Pilot Data" }
-```
-
-`username` is the user's **email** — JupyterHub identifies users by email via
-Keycloak OIDC, and the per-user directories on disk are named by it.
-
-Returns the standard `ProvisionResult`. `404` if `partner` is not one of
-`RDN CEDER BER CEA CARTIF REA ENGREEN`; idempotent, so the dashboard can call
-it on every page load.
-
-This creates a **symlink**, not a copy:
-
-```
-/jupyterhub_data/datasets/{email}/{dataset_name}  ->  /home/jovyan/.pilot/{PARTNER}
-```
-
-The target is a container-side path, so the link is deliberately dangling when
-viewed on the host and resolves inside the user's server. Because it is created
-under the user's already-mounted data directory, it appears in an **already
-running** server — no restart needed, as Jupyter caches no filesystem state.
+Multipart form fields `username`, `dataset_name` and `metadata` (file). The
+file must contain valid JSON and is stored under its own file name in
+`user_{username}/{dataset_name}/`. Returns
+`{"status": "ok", "object": "user_x/ds/metadata.json"}`.
 
 ### POST `/api/v1/pilot-export/run`
 
-Forces an export without waiting for the nightly schedule.
+Starts an export without waiting for the nightly schedule.
 
 ```json
-{ "partners": ["REA"] }          // omit or null for all seven
+{ "partners": ["REA"] }
 ```
 
-Returns `202` and runs in the background. Add `?wait=true` to block for the
-results — only sensible for small partners. For a big one, prefer the CLI in
-the scheduler container so the work stays out of the API container:
+Leave out `partners` or send `null` to export all seven. An unknown partner
+returns `404`.
+
+By default the export runs in the background and the endpoint returns `202`
+with `{"started": [...], "detail": "..."}`. Add `?wait=true` to wait for the
+results, which returns `{"results": [...]}` with one summary per partner. Use
+`wait` only for small partners, since CEDER takes far longer than an HTTP
+timeout.
+
+Each export takes a per-partner lock in the shared directory. A manual run that
+overlaps a scheduled run of the same partner fails for that partner and leaves
+the other export running.
+
+For large partners, run the CLI in the scheduler container so the export does
+not run inside the API container.
 
 ```bash
 docker compose exec pilot-export-scheduler python -m app.export_cli CEDER
@@ -264,19 +298,20 @@ docker compose exec pilot-export-scheduler python -m app.export_cli CEDER
 
 ### GET `/api/v1/pilot-export/status`
 
-Per-partner size and timestamp of the last successful export, plus free space
-on the shared volume.
+Returns the size and modification time of each partner's Parquet file, whether
+it exists, its MinIO object name, and the free space on the shared volume.
 
 ## Pilot datasets
 
-Pilot data is platform-owned and byte-identical for every user, so there is
-**one copy on disk**, not one per user. Copying CEDER (~127M rows) per user
-would cost several GB each time somebody clicks "add dataset".
+Pilot data is owned by the platform and is the same for every user, so there
+is one copy on disk for everyone. Users get symlinks to it through
+`POST /api/v1/provision/pilot`.
 
 ### Nightly export
 
-A separate container (`pilot-export-scheduler`) runs APScheduler's
-`BlockingScheduler`. For each partner it streams
+The `pilot-export-scheduler` container runs an APScheduler
+`BlockingScheduler`. For each partner it streams the following query from the
+partner's database in the CARTIF data lake.
 
 ```
 COPY (SELECT <calendar_id decoded> AS datetime, sensor_id,
@@ -285,130 +320,140 @@ COPY (SELECT <calendar_id decoded> AS datetime, sensor_id,
       ORDER BY sensor_id, calendar_id) TO STDOUT WITH (FORMAT CSV, HEADER)
 ```
 
-through gzip into the hidden temp file `.<PARTNER>.csv.gz.part`. That file is
-converted in streaming batches into `.<PARTNER>.parquet.part`, then uploaded to
-MinIO as `<PARTNER>.csv.gz`, and the Parquet file is `os.replace()`d onto
-`<PARTNER>.parquet` in the shared dir. Nothing is ever held in memory —
-peak RSS is a few MB regardless of table size — and because the rename is
-atomic and same-directory, a user reading the file in a running notebook sees
-either the old complete export or the new one, never a truncated file.
+| Partner | Database |
+|---------|----------|
+| RDN | `TEF1_RDN` |
+| CEDER | `TEF2_CEDER` |
+| BER | `TEF3_BER` |
+| CEA | `TEF4_CEA` |
+| CARTIF | `TEF5_CARTIF` |
+| REA | `TEF6_REA` |
+| ENGREEN | `TEF7_ENGREEN` |
 
-Why a separate container: a multi-GB export cannot block API request handling,
-and redeploying the API does not kill a running export. Why APScheduler rather
-than cron: the job stays in Python and reuses this repo's config, MinIO client
-and logging, while `max_instances=1` gives overlap prevention for free.
+The output goes through gzip into the hidden temp file
+`.<PARTNER>.csv.gz.part`. That file is converted in batches into
+`.<PARTNER>.parquet.part` (zstd compressed), and the two row counts are
+checked against each other. The gzipped CSV is then uploaded to MinIO as
+`pilot_datasets/<PARTNER>/<PARTNER>.csv.gz`, and the Parquet file is renamed
+with `os.replace()` to `<PARTNER>.parquet` in the shared directory. Any older
+`<PARTNER>.csv` or `<PARTNER>.csv.gz` in that directory is deleted. The rename is atomic and happens in the same directory, so a user reading the file
+in a running notebook sees either the previous complete export or the new one.
 
-Exports are **serialized** (single-worker executor) and staggered 45 minutes
-apart from 01:00, largest partner first:
+If the MinIO upload fails, the Parquet file is still published and the result
+reports the MinIO error.
+
+Exports run one at a time (single worker executor) and start 45 minutes apart
+from 01:00 container time, largest partner first.
 
 | 01:00 | 01:45 | 02:30 | 03:15 | 04:00 | 04:45 | 05:30 |
 |-------|-------|-------|-------|-------|-------|-------|
 | CEDER | RDN | BER | CEA | CARTIF | REA | ENGREEN |
 
-`misfire_grace_time` must stay larger than a full CEDER run, or partners queued
-behind it get dropped as misfires.
+If an export runs past the next slot, the next partner waits in the queue. It
+still runs as long as it starts within `PILOT_EXPORT_MISFIRE_GRACE_TIME`.
 
-One partner failing never aborts the others — each returns its own result, and
-a partner whose database has no `public.f_tsdata` yet (RDN, at the time of
-writing) fails cleanly and leaves the previous export in place.
+A failed partner does not stop the others. If a partner's database has no
+`public.f_tsdata` table, its export fails and the previous export stays in
+place.
+
+The scheduler does not start if `DATALAKE_PASSWORD` is empty. On shutdown it
+waits for a running export to finish.
 
 ### Startup catch-up
 
-When the scheduler container starts it queues a one-off export for any partner
-whose file is missing or older than `PILOT_EXPORT_MAX_AGE_HOURS`, so a first
-deploy — or a restart after the VM was down overnight — produces data without
-waiting for 01:00.
+When the scheduler container starts, it queues a one-off export for every
+partner whose file is missing or older than `PILOT_EXPORT_MAX_AGE_HOURS`. The
+exports start after `PILOT_EXPORT_STARTUP_DELAY_SECONDS`. This way a first
+deploy, or a restart after the VM was down overnight, produces data without
+waiting for 01:00. Partners with a recent export are skipped, so a routine
+restart or redeploy does not export anything.
 
-This is deliberately **conditional on staleness**, not unconditional. The
-container restarts on crash, on Docker daemon restart and on every redeploy;
-running exports on each of those would re-export CEDER (~127M rows) every time,
-hammer the CARTIF data lake, and drag a multi-GB job into the middle of the
-working day. With the age check, a crash loop or a routine redeploy finds fresh
-files and does nothing.
+Catch-up jobs use the same single worker executor as the nightly jobs and never
+run at the same time as a scheduled export. Set `PILOT_EXPORT_ON_STARTUP=false`
+to turn catch-up off.
 
-Catch-up jobs go through the same single-worker executor as the cron jobs, so
-they can never run alongside a scheduled export. Set
-`PILOT_EXPORT_ON_STARTUP=false` to disable.
-
-Note this lives in the **scheduler** container. Restarting the API container
-(`data-management-server`) has no effect on exports — it never runs them.
+Catch-up runs only in the scheduler container. Restarting the API container
+(`data-management-server`) does not trigger exports.
 
 ### Access
 
-`pilot_datasets/` is bind-mounted **read-only** into every singleuser container
-at `/home/jovyan/.pilot` by JupyterHub's `pre_spawn_hook`. That mount is a
-prerequisite for `POST /api/v1/provision/pilot` — without it the provisioned
-symlinks dangle inside the container too.
+JupyterHub's `pre_spawn_hook` bind-mounts `pilot_datasets/` read-only into
+every singleuser container at `/home/jovyan/.pilot`. The symlinks created by
+`POST /api/v1/provision/pilot` point into that mount.
 
-JupyterHub gets Parquet rather than CSV: every partner's CSV is too large for
-JupyterLab's CSV viewer anyway (CEDER is ~9 GB), and Parquet is typed, much
-smaller, and can be read one sensor at a time. In a notebook:
+JupyterHub users get Parquet files. Every partner's CSV is too large for the
+JupyterLab CSV viewer (CEDER is about 9 GB), while Parquet is typed, much
+smaller, and can be read one sensor at a time. In a notebook
 
 ```python
 df = pd.read_parquet('datasets/REA Pilot Data/REA.parquet')
 
-# One sensor only — skips the rest of the file:
+# One sensor only, skipping the rest of the file
 pd.read_parquet('datasets/CEDER Pilot Data/CEDER.parquet',
                 filters=[('sensor_id', '==', 'ACTARIS')])
 ```
 
-MinIO (and so the dashboard download) keeps the gzipped CSV.
+MinIO, and so the dashboard download, keeps the gzipped CSV.
 
 ### File format
 
-Same columns in both copies; the Parquet types are in brackets.
+Both copies have the same columns. The Parquet types are in brackets.
 
 | Column | Source | Notes |
 |--------|--------|-------|
-| `datetime` (timestamp, s) | `f_tsdata.calendar_id` | `YYYY-MM-DD HH:MM:SS` in the CSV, no time zone (the data lake stores none). `calendar_id` is `YYYYMMDDHHMMSS` for CEDER/CEA and `YYYYMMDDHHMM` for the other partners; both are decoded |
-| `sensor_id` (string) | `f_tsdata.sensor_id` | Unchanged; kept as a string so all-digit ids (REA) keep their leading zeros |
-| `values` (float64) | `f_tsdata.f_value` | Reading |
-| `corrected` (bool) | `f_tsdata.corrected` | `true` if the value was imputed by the data quality corrector rather than measured (D3.1 §3.4) |
+| `datetime` (timestamp, s) | `f_tsdata.calendar_id` | `YYYY-MM-DD HH:MM:SS` in the CSV |
+| `sensor_id` (string) | `f_tsdata.sensor_id` | - |
+| `values` (float64) | `f_tsdata.f_value` | - |
+| `corrected` (bool) | `f_tsdata.corrected` | `true` if the data quality corrector imputed the value, `false` if it was measured |
 
-Rows are sorted by `sensor_id`, then `datetime`. `f_tsdata.ts_id` is not
-exported: it is only the data lake's row key, has gaps, and does not follow
+Rows are sorted by `sensor_id`, then `datetime`. 
 time.
 
 ## Configuration
 
-All configuration is via environment variables (loaded from `.env`):
+Both containers read their configuration from environment variables, loaded
+from `.env`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `API_KEY` | _(required)_ | Internal service-to-service auth key |
+| `API_KEY` | _(required)_ | Key expected in the `X-API-Key` header |
 | `MINIO_ENDPOINT` | `minio-backend.energy-guard.eu` | MinIO hostname |
 | `MINIO_ACCESS_KEY` | _(required)_ | MinIO access key |
 | `MINIO_SECRET_KEY` | _(required)_ | MinIO secret key |
 | `MINIO_SECURE` | `true` | Use HTTPS for MinIO |
 | `DATASETS_BUCKET` | `datasets` | MinIO bucket for datasets |
 | `NOTEBOOKS_BUCKET` | `notebooks` | MinIO bucket for notebooks |
-| `PILOT_PREFIX` | `user_pilot` | Prefix for platform/pilot datasets (reserved, unused) |
-| `PILOT_DATASETS_PREFIX` | `pilot_datasets` | MinIO prefix **and** shared-dir name for the nightly pilot exports |
-| `PILOT_MOUNT_PATH` | `/home/jovyan/.pilot` | Where pilot data is mounted read-only in singleuser containers; must match JupyterHub's `pre_spawn_hook` |
-| `DATALAKE_HOST` | `srv9.cartif.es` | CARTIF data lake host (this VM's IP is allow-listed) |
-| `DATALAKE_PORT` | `60007` | CARTIF data lake port |
-| `DATALAKE_USER` | `readonlyaccess` | Read-only data lake account |
-| `DATALAKE_PASSWORD` | _(required for exports)_ | Data lake password — **never hardcode it** |
-| `PILOT_EXPORT_HOUR` / `PILOT_EXPORT_MINUTE` | `1` / `0` | First export slot of the night |
-| `PILOT_EXPORT_STAGGER_MINUTES` | `45` | Gap between consecutive partners |
-| `PILOT_EXPORT_MISFIRE_GRACE_TIME` | `14400` | How late a queued/missed export may still start (must exceed a full CEDER run) |
-| `PILOT_EXPORT_ON_STARTUP` | `true` | Catch up missing/stale partners when the scheduler container starts |
-| `PILOT_EXPORT_MAX_AGE_HOURS` | `36` | Age past which a partner is considered stale — keep it above the 24h cadence |
-| `PILOT_EXPORT_STARTUP_DELAY_SECONDS` | `60` | Delay before catch-up work begins |
-| `JUPYTERHUB_DATA_PATH` | `/jupyterhub_data` | Container path to shared JupyterHub data |
+| `PILOT_PREFIX` | `user_pilot` | Currently unused |
+| `PILOT_DATASETS_PREFIX` | `pilot_datasets` | MinIO prefix and shared directory name for the pilot exports. The dashboard and JupyterHub use the same value |
+| `PILOT_MOUNT_PATH` | `/home/jovyan/.pilot` | Where pilot data is mounted in singleuser containers. Must match JupyterHub's `pre_spawn_hook` |
+| `DATALAKE_HOST` | `_(required)_` | data lake host (this VM's IP is allow-listed) |
+| `DATALAKE_PORT` | `_(required)_` | data lake port |
+| `DATALAKE_USER` | `_(required)_` | data lake account |
+| `DATALAKE_PASSWORD` | _(required for exports)_ | Data lake password |
+| `DATALAKE_CONNECT_TIMEOUT` | `30` | Data lake connection timeout in seconds |
+| `DATALAKE_STATEMENT_TIMEOUT_MS` | `21600000` | Maximum run time of one partner's query (6 hours) |
+| `PILOT_EXPORT_GZIP_LEVEL` | `6` | gzip level for the CSV uploaded to MinIO |
+| `PILOT_EXPORT_HOUR` / `PILOT_EXPORT_MINUTE` | `1` / `0` | Start time of the first export of the night |
+| `PILOT_EXPORT_STAGGER_MINUTES` | `45` | Gap between the start times of consecutive partners |
+| `PILOT_EXPORT_MISFIRE_GRACE_TIME` | `14400` | How many seconds late a queued or missed export may still start. Should be longer than a full CEDER run |
+| `PILOT_EXPORT_ON_STARTUP` | `true` | Export missing or stale partners when the scheduler container starts |
+| `PILOT_EXPORT_MAX_AGE_HOURS` | `36` | Age in hours after which a partner's export counts as stale. Should be above 24 |
+| `PILOT_EXPORT_STARTUP_DELAY_SECONDS` | `60` | Delay before catch-up exports start |
+| `JUPYTERHUB_DATA_PATH` | `/jupyterhub_data` | Container path of the shared JupyterHub data directory |
 | `LOG_LEVEL` | `INFO` | Logging level |
+| `TZ` | `Europe/Athens` | Time zone of the scheduler container, used for the export times. Set in `docker-compose.yaml` |
 
 ## Deployment
 
 ### 1. Create the shared data directory on the host
 
 ```bash
-sudo mkdir -p path/to/jupyterhub_data/datasets \
-              path/to/jupyterhub_data/notebooks \
-              path/to/jupyterhub_data/pilot_datasets
+sudo mkdir -p /mnt/datadisk/volumes/jupyterhub_data/datasets \
+              /mnt/datadisk/volumes/jupyterhub_data/notebooks \
+              /mnt/datadisk/volumes/jupyterhub_data/pilot_datasets
 ```
 
-### 2. Generate a strong API key and set it in `.env`
+### 2. Generate an API key and set it in `.env`
 
 ```bash
 openssl rand -hex 32
@@ -417,35 +462,39 @@ openssl rand -hex 32
 
 ### 3. Set `DATALAKE_PASSWORD` in `.env`
 
-Required by the export job. `.env` is gitignored; the password must not appear
-in source.
+The export scheduler needs it. `.env` is ignored by git.
 
 ### 4. Build and start the services
 
-Starts both the API and the `pilot-export-scheduler` container:
+This starts the API and the `pilot-export-scheduler` container. Both join the
+external Docker network `nginxproxy_energyguard_net`, and the API listens on
+port 6060. Other containers reach it at `http://data-management-server:6060`.
 
 ```bash
 cd path/to/data_managment_server
 docker compose up -d --build
 ```
 
-### 5. Restart JupyterHub to pick up the new config/volume
+### 5. Restart JupyterHub to pick up the new config and volumes
 
-Required for pilot datasets — this is what adds the read-only `/home/jovyan/.pilot`
-mount. Users with a server already running must restart it once to get the new
-mount; after that, newly provisioned pilot datasets appear without a restart.
+This adds the read-only `/home/jovyan/.pilot` mount needed for pilot datasets.
+Users whose server is already running must restart it once to get the mount.
+After that, new pilot datasets appear without a restart.
 
 ```bash
 cd path/to/energyguard/JupyterHub
 docker compose up -d --build
 ```
 
-### 6. Seed the pilot exports
+### 6. Run the first pilot export
 
-The nightly schedule will fill these in on its own, but the first run is worth
-doing by hand:
+The nightly schedule and the startup catch-up fill in the exports on their own.
+To run the first export by hand and follow its progress
 
 ```bash
 docker compose exec pilot-export-scheduler python -m app.export_cli --all
 docker compose logs -f pilot-export-scheduler
 ```
+
+The CLI also takes one or more partner codes in place of `--all`, prints a
+summary table, and exits with a non-zero code if any partner failed.
