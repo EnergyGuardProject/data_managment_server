@@ -1,6 +1,6 @@
 # EnergyGuard Data Provisioning Server
 
-Internal FastAPI service that sits between the dashboard and JupyterHub.
+Internal FastAPI service that sits between the EnergyGuard dashboard and JupyterHub.
 It provisions datasets and notebook files into each user's JupyterHub home
 directory and exports the pilot partner data from the EnergyGuard data lake every
 night.
